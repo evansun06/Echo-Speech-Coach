@@ -24,6 +24,7 @@ import type {
   Annotation,
   ApiError,
   ChatMessage,
+  CoachLedgerEntry,
   CoachNote,
   CoachProgress,
   CoachingSessionDetail,
@@ -103,6 +104,57 @@ function shouldShowLiveNotes(status: SessionStatus): boolean {
   return LIVE_NOTES_STATUSES.includes(status)
 }
 
+function FinalLedgerPanel({ entries }: { entries: CoachLedgerEntry[] }) {
+  return (
+    <Card variant="outlined">
+      <CardContent sx={{ p: 1.5, '&:last-child': { pb: 1.5 } }}>
+        <Stack spacing={1}>
+          <Typography variant="subtitle2">Final Ledger</Typography>
+          <Box
+            sx={{
+              borderRadius: 1,
+              border: '1px solid',
+              borderColor: 'grey.800',
+              bgcolor: '#101317',
+              color: '#b7c0cb',
+              minHeight: 180,
+              maxHeight: 320,
+              overflowY: 'auto',
+              px: 1.25,
+              py: 1,
+              fontFamily: '"IBM Plex Mono", "Fira Code", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
+              fontSize: 12,
+              lineHeight: 1.5,
+            }}
+          >
+            {entries.length === 0 ? (
+              <Typography component="div" sx={{ color: '#8f99a7', fontFamily: 'inherit', fontSize: 'inherit' }}>
+                Final ledger is empty.
+              </Typography>
+            ) : (
+              entries.map((entry) => (
+                <Box key={`${entry.sequence}-${entry.created_at}`} sx={{ mb: 1 }}>
+                  <Typography component="div" sx={{ fontFamily: 'inherit', fontSize: 'inherit' }}>
+                    [{entry.sequence}] {entry.entry_kind} • {entry.agent_name || '-'}
+                  </Typography>
+                  <Typography component="div" sx={{ fontFamily: 'inherit', fontSize: 'inherit', color: '#d7dee8' }}>
+                    {entry.content}
+                  </Typography>
+                  {Object.keys(entry.payload ?? {}).length > 0 && (
+                    <Typography component="div" sx={{ fontFamily: 'inherit', fontSize: 'inherit', color: '#8f99a7' }}>
+                      payload={JSON.stringify(entry.payload)}
+                    </Typography>
+                  )}
+                </Box>
+              ))
+            )}
+          </Box>
+        </Stack>
+      </CardContent>
+    </Card>
+  )
+}
+
 function CoachNoteCard({ note }: { note: CoachNote }) {
   const [isExpanded, setIsExpanded] = useState(!note.default_collapsed)
 
@@ -164,6 +216,8 @@ function CoachPanelContent({
   retryError: string | null
   showReadyTransition: boolean
 }) {
+  const ledgerEntries = coachProgress?.ledger_entries ?? []
+
   if (session.status === 'ready') {
     return (
       <Stack spacing={2}>
@@ -189,10 +243,18 @@ function CoachPanelContent({
         </Fade>
 
         <Typography variant="h6">Coach Review</Typography>
-        {!coachProgress || coachProgress.stages.length === 0 ? (
-          <Alert severity="info">Coach review sections are unavailable until coach_progress is added to the backend response.</Alert>
+        {!coachProgress ? (
+          <Stack spacing={1.25}>
+            <Alert severity="info">Coach review sections are unavailable until coach_progress is added to the backend response.</Alert>
+            <FinalLedgerPanel entries={ledgerEntries} />
+          </Stack>
         ) : (
           <Stack spacing={1.25}>
+            {coachProgress.stages.length === 0 && (
+              <Typography variant="body2" color="text.secondary">
+                No coach stages yet.
+              </Typography>
+            )}
             {coachProgress.stages.map((stage) => (
               <Card key={stage.stage_key} variant="outlined">
                 <CardContent sx={{ p: 1.5, '&:last-child': { pb: 1.5 } }}>
@@ -229,6 +291,7 @@ function CoachPanelContent({
                 </CardContent>
               </Card>
             ))}
+            <FinalLedgerPanel entries={ledgerEntries} />
           </Stack>
         )}
       </Stack>

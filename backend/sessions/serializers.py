@@ -79,6 +79,47 @@ def _extract_evidence_refs(payload: dict[str, Any]) -> list[str]:
     return [item for item in maybe_refs if isinstance(item, str)]
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _serialize_live_ledger_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    payload = entry.get("payload")
+    return {
+        "sequence": _safe_int(entry.get("sequence", 0)),
+        "entry_kind": str(entry.get("entry_kind", "")),
+        "agent_kind": (
+            str(entry.get("agent_kind"))
+            if entry.get("agent_kind") is not None
+            else None
+        ),
+        "agent_name": str(entry.get("agent_name", "")),
+        "window_start_ms": entry.get("window_start_ms"),
+        "window_end_ms": entry.get("window_end_ms"),
+        "content": str(entry.get("content", "")),
+        "payload": payload if isinstance(payload, dict) else {},
+        "created_at": str(entry.get("created_at", "")),
+    }
+
+
+def _serialize_db_ledger_entry(entry) -> dict[str, Any]:
+    payload = entry.payload if isinstance(entry.payload, dict) else {}
+    return {
+        "sequence": int(entry.sequence),
+        "entry_kind": str(entry.entry_kind),
+        "agent_kind": str(entry.agent_kind) if entry.agent_kind else None,
+        "agent_name": str(entry.agent_name or ""),
+        "window_start_ms": entry.window_start_ms,
+        "window_end_ms": entry.window_end_ms,
+        "content": str(entry.content),
+        "payload": payload,
+        "created_at": entry.created_at.isoformat(),
+    }
+
+
 def _select_progress_run(session: CoachingSession) -> CoachOrchestrationRun | None:
     active_run = (
         session.coach_runs.filter(
@@ -226,6 +267,7 @@ class SessionDetailSerializer(serializers.ModelSerializer):
                 "current_stage": "",
                 "agent_progress": [],
                 "stages": [],
+                "ledger_entries": [],
             }
 
         executions = list(
@@ -235,6 +277,10 @@ class SessionDetailSerializer(serializers.ModelSerializer):
         live_entries, live_latest_sequence = _read_live_ledger_entries(run)
         use_live_entries = bool(live_entries)
         if use_live_entries:
+            live_entries = sorted(
+                live_entries,
+                key=lambda item: _safe_int(item.get("sequence", 0)),
+            )
             executions = sorted(
                 executions,
                 key=lambda item: (
@@ -244,6 +290,18 @@ class SessionDetailSerializer(serializers.ModelSerializer):
                     item.created_at,
                 ),
             )
+
+        if use_live_entries:
+            serialized_ledger_entries = [
+                _serialize_live_ledger_entry(entry)
+                for entry in live_entries
+                if isinstance(entry, dict)
+            ]
+        else:
+            serialized_ledger_entries = [
+                _serialize_db_ledger_entry(entry)
+                for entry in ledger_entries
+            ]
 
         notes_by_execution_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
         if use_live_entries:
@@ -342,4 +400,5 @@ class SessionDetailSerializer(serializers.ModelSerializer):
             "current_stage": current_stage,
             "agent_progress": agent_progress,
             "stages": stages,
+            "ledger_entries": serialized_ledger_entries,
         }

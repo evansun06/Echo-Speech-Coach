@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
+import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -8,6 +11,8 @@ from typing import List, Dict, Any, Optional
 import pandas as pd
 from google.cloud import speech
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 FILLER_WORDS = {
@@ -58,9 +63,33 @@ def transcribe_words_google(
     1) word-level dataframe
     2) transcript text
     """
-    client = speech.SpeechClient()
-
     audio_file = Path(audio_path)
+    timeout_seconds = float(os.environ.get("ML_STT_RECOGNIZE_TIMEOUT_SECONDS", "30"))
+    requested_transport = os.environ.get("ML_STT_TRANSPORT", "rest").strip().lower()
+    transport = requested_transport if requested_transport in {"grpc", "rest"} else "rest"
+    file_size_bytes = audio_file.stat().st_size
+    # LINEAR16 mono -> ~2 bytes per sample
+    estimated_duration_sec = file_size_bytes / max(sample_rate_hz * 2.0, 1.0)
+
+    logger.info(
+        (
+            "STT request start | audio_path=%s file_size_mb=%.2f "
+            "estimated_duration_sec=%.2f language=%s sample_rate_hz=%s timeout_sec=%.1f"
+        ),
+        str(audio_file.resolve()),
+        file_size_bytes / (1024 * 1024),
+        estimated_duration_sec,
+        language_code,
+        sample_rate_hz,
+        timeout_seconds,
+    )
+
+    logger.info(
+        "STT client init | transport=%s pid=%s",
+        transport,
+        os.getpid(),
+    )
+    client = speech.SpeechClient(transport=transport)
     with open(audio_file, "rb") as f:
         content = f.read()
 
@@ -75,7 +104,22 @@ def transcribe_words_google(
         enable_automatic_punctuation=True,
     )
 
-    response = client.recognize(config=config, audio=audio)
+    t0 = time.time()
+    try:
+        response = client.recognize(
+            config=config,
+            audio=audio,
+            timeout=timeout_seconds,
+        )
+    except Exception as exc:
+        logger.exception(
+            "STT request failed | error_type=%s timeout_sec=%.1f elapsed_sec=%.3f",
+            type(exc).__name__,
+            timeout_seconds,
+            time.time() - t0,
+        )
+        raise
+    rpc_duration_sec = time.time() - t0
     # print("\n=== RAW GOOGLE STT RESPONSE ===")
     # print("num results:", len(response.results))
     # for i, result in enumerate(response.results):
@@ -116,6 +160,12 @@ def transcribe_words_google(
     )
 
     transcript_text = " ".join(transcript_parts).strip()
+    logger.info(
+        "STT request completed | results=%s words=%s rpc_duration_sec=%.3f",
+        len(response.results),
+        len(word_df),
+        rpc_duration_sec,
+    )
     return word_df, transcript_text
 
 

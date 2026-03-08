@@ -16,7 +16,12 @@ export DB_HOST="${HYBRID_DB_HOST:-localhost}"
 export DB_PORT="${HYBRID_DB_PORT:-5433}"
 export CELERY_BROKER_URL="${HYBRID_CELERY_BROKER_URL:-redis://localhost:6379/0}"
 export CELERY_RESULT_BACKEND="${HYBRID_CELERY_RESULT_BACKEND:-redis://localhost:6379/1}"
+export LLM_LEDGER_REDIS_URL="${HYBRID_LLM_LEDGER_REDIS_URL:-$CELERY_BROKER_URL}"
+export MEDIA_ROOT="${HYBRID_MEDIA_ROOT:-$BACKEND_DIR/media}"
 export GOOGLE_APPLICATION_CREDENTIALS="${GOOGLE_APPLICATION_CREDENTIALS:-$HOME/.config/gcloud/application_default_credentials.json}"
+export HYBRID_CELERY_POOL="${HYBRID_CELERY_POOL:-solo}"
+export HYBRID_CELERY_CONCURRENCY="${HYBRID_CELERY_CONCURRENCY:-1}"
+mkdir -p "$MEDIA_ROOT"
 
 if [ -n "${HYBRID_PYTHON_BIN:-}" ]; then
   PYTHON_BIN="$HYBRID_PYTHON_BIN"
@@ -29,4 +34,9 @@ else
 fi
 
 cd "$BACKEND_DIR"
-exec "$PYTHON_BIN" -m celery -A config worker -l "${CELERY_WORKER_LOGLEVEL:-info}" -E "$@"
+exec "$PYTHON_BIN" -m celery -A config worker \
+  -l "${CELERY_WORKER_LOGLEVEL:-info}" \
+  -E \
+  --pool "${HYBRID_CELERY_POOL}" \
+  --concurrency "${HYBRID_CELERY_CONCURRENCY}" \
+  "$@"

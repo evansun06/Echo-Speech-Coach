@@ -54,7 +54,12 @@ from llm.subagent_workflow import (
     run_subagent_execution,
 )
 from llm.tasks import run_flagship_final_reconcile_task
-from ml.enqueue import enqueue_random_sleep_demo_job, enqueue_random_sleep_demo_jobs
+from ml.enqueue import (
+    enqueue_random_sleep_demo_job,
+    enqueue_random_sleep_demo_jobs,
+    enqueue_session_ml_workflow_job,
+)
+from ml.tasks import run_session_ml_workflow_task
 from sessions.models import (
     CoachAgentExecution,
     CoachAgentExecutionStatus,
@@ -67,6 +72,7 @@ from sessions.models import (
     MAX_VIDEO_FILE_SIZE_BYTES,
     CoachingSession,
     MaxFileSizeValidator,
+    SessionEvent,
     SessionStatus,
 )
 
@@ -109,6 +115,18 @@ class DemoEnqueueWrapperTests(SimpleTestCase):
 
         self.assertEqual(task_ids, ["task-1", "task-2", "task-3"])
         self.assertEqual(enqueue_mock.call_count, 3)
+
+    @patch("ml.enqueue.run_session_ml_workflow_task.apply_async")
+    def test_enqueue_session_ml_workflow_job_dispatches_expected_kwargs(
+        self,
+        apply_async_mock,
+    ):
+        apply_async_mock.return_value = SimpleNamespace(id="ml-task-1")
+
+        result = enqueue_session_ml_workflow_job(session_id="session-1")
+
+        apply_async_mock.assert_called_once_with(kwargs={"session_id": "session-1"})
+        self.assertEqual(result.id, "ml-task-1")
 
 
 class SubagentEnqueueWrapperTests(SimpleTestCase):
@@ -394,6 +412,62 @@ class FlagshipFinalTaskTests(SimpleTestCase):
             system_prompt="system prompt",
         )
         self.assertEqual(result["status"], "completed")
+
+
+class FlagshipFinalTaskSessionLifecycleTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            username="flagship-task@example.com",
+            email="flagship-task@example.com",
+            password="password123",
+        )
+        self.session = CoachingSession.objects.create(
+            user=self.user,
+            status=SessionStatus.PROCESSING_COACH,
+            video_file="sessions/videos/2026/03/08/demo.mp4",
+        )
+        self.run = CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.PROCESSING,
+        )
+
+    @patch("llm.tasks.logger")
+    @patch("llm.tasks.run_flagship_final_reconciliation")
+    def test_run_flagship_final_task_marks_session_ready_and_logs_ledger(
+        self,
+        workflow_mock,
+        logger_mock,
+    ):
+        workflow_mock.return_value = {"status": "completed", "run_id": str(self.run.id)}
+        CoachLedgerEntry.objects.create(
+            run=self.run,
+            sequence=1,
+            entry_kind=LedgerEntryKind.FLAGSHIP_FINAL,
+            content="Final summary",
+            payload={"title": "Final reconciliation"},
+        )
+
+        result = run_flagship_final_reconcile_task(run_id=str(self.run.id))
+
+        self.session.refresh_from_db()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(self.session.status, SessionStatus.READY)
+        self.assertGreaterEqual(logger_mock.info.call_count, 1)
+
+    @patch("llm.tasks.run_flagship_final_reconciliation")
+    def test_run_flagship_final_task_marks_session_coach_failed_on_exception(
+        self,
+        workflow_mock,
+    ):
+        workflow_mock.side_effect = RuntimeError("flagship failed")
+
+        with self.assertRaises(RuntimeError):
+            run_flagship_final_reconcile_task(run_id=str(self.run.id))
+
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, SessionStatus.COACH_FAILED)
 
 
 class FlagshipFinalWorkflowEntryTests(SimpleTestCase):
@@ -1153,6 +1227,175 @@ class SubagentWorkflowServiceTests(TestCase):
         clear_live_ledger_mock.assert_called_once_with(run_id=str(self.run.id))
 
 
+class SessionMlWorkflowTaskTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            username="ml-workflow@example.com",
+            email="ml-workflow@example.com",
+            password="password123",
+        )
+        self.session = CoachingSession.objects.create(
+            user=self.user,
+            status=SessionStatus.QUEUED_ML,
+            video_file="sessions/videos/2026/03/08/demo.mp4",
+        )
+
+    @patch("ml.tasks.enqueue_full_coach_workflow_job")
+    @patch("ml.tasks.persist_canonical_payload")
+    @patch("ml.tasks.run_pipeline")
+    @patch("ml.tasks._resolve_ml_media_inputs")
+    def test_run_session_ml_workflow_task_happy_path_moves_to_processing_coach(
+        self,
+        resolve_media_mock,
+        run_pipeline_mock,
+        persist_mock,
+        enqueue_coach_mock,
+    ):
+        resolve_media_mock.return_value = {
+            "audio_path": "sample.wav",
+            "video_path": "sample.mp4",
+            "source": "sample_fallback",
+            "fallback_reason": "failed_audio_extract_from_session_video",
+        }
+        run_pipeline_mock.return_value = {
+            "canonical_payload": {
+                "aligned_table": [
+                    {"word": "Hello", "start_sec": 0.1, "end_sec": 0.3},
+                    {"word": "there", "start_sec": 0.4, "end_sec": 0.7},
+                ],
+                "events": [
+                    {
+                        "event_id": 5,
+                        "event_type": "hesitation",
+                        "start_sec": 0.2,
+                        "end_sec": 0.5,
+                    }
+                ],
+            }
+        }
+        persist_mock.return_value = {
+            "session_uuid": str(self.session.id),
+            "written": True,
+            "reason": "",
+            "overall_rows": 1,
+            "aligned_rows": 2,
+            "event_rows": 1,
+        }
+        enqueue_coach_mock.return_value = {
+            "run_id": "run-1",
+            "workflow_task_id": "coach-task-1",
+        }
+
+        result = run_session_ml_workflow_task(session_id=str(self.session.id))
+
+        self.session.refresh_from_db()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["workflow_task_id"], "coach-task-1")
+        self.assertEqual(result["windows_count"], 1)
+        self.assertEqual(self.session.status, SessionStatus.PROCESSING_COACH)
+        self.assertEqual(self.session.coach_task_id, "coach-task-1")
+        enqueue_coach_mock.assert_called_once()
+        windows = enqueue_coach_mock.call_args.kwargs["windows"]
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0]["events"][0]["event_id"], "5")
+        self.assertEqual(windows[0]["word_map"][0]["word"], "Hello")
+
+    @patch("ml.tasks.enqueue_full_coach_workflow_job")
+    @patch("ml.tasks.persist_canonical_payload")
+    @patch("ml.tasks.run_pipeline")
+    def test_run_session_ml_workflow_task_falls_back_to_sample_media_when_session_media_is_unavailable(
+        self,
+        run_pipeline_mock,
+        persist_mock,
+        enqueue_coach_mock,
+    ):
+        run_pipeline_mock.return_value = {
+            "canonical_payload": {
+                "aligned_table": [{"word": "Hello", "start_sec": 0.1, "end_sec": 0.3}],
+                "events": [{"event_id": 1, "event_type": "steady_pacing", "start_sec": 0.2, "end_sec": 0.4}],
+            }
+        }
+        persist_mock.return_value = {
+            "session_uuid": str(self.session.id),
+            "written": True,
+            "reason": "",
+            "overall_rows": 1,
+            "aligned_rows": 1,
+            "event_rows": 1,
+        }
+        enqueue_coach_mock.return_value = {
+            "run_id": "run-1",
+            "workflow_task_id": "coach-task-1",
+        }
+
+        result = run_session_ml_workflow_task(session_id=str(self.session.id))
+
+        self.assertEqual(result["ml_media_source"], "sample_fallback")
+        self.assertTrue(run_pipeline_mock.call_args.kwargs["audio_path"].endswith("/ml/evan_test.wav"))
+        self.assertTrue(run_pipeline_mock.call_args.kwargs["video_path"].endswith("/ml/evan_test.mp4"))
+
+    @patch("ml.tasks.run_pipeline")
+    @patch("ml.tasks._resolve_ml_media_inputs")
+    def test_run_session_ml_workflow_task_sets_failed_when_ml_phase_raises(
+        self,
+        resolve_media_mock,
+        run_pipeline_mock,
+    ):
+        resolve_media_mock.return_value = {
+            "audio_path": "sample.wav",
+            "video_path": "sample.mp4",
+            "source": "sample_fallback",
+            "fallback_reason": "missing_session_video",
+        }
+        run_pipeline_mock.side_effect = RuntimeError("ml failed")
+
+        with self.assertRaises(RuntimeError):
+            run_session_ml_workflow_task(session_id=str(self.session.id))
+
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, SessionStatus.FAILED)
+
+    @patch("ml.tasks.enqueue_full_coach_workflow_job")
+    @patch("ml.tasks.persist_canonical_payload")
+    @patch("ml.tasks.run_pipeline")
+    @patch("ml.tasks._resolve_ml_media_inputs")
+    def test_run_session_ml_workflow_task_sets_coach_failed_after_ml_ready(
+        self,
+        resolve_media_mock,
+        run_pipeline_mock,
+        persist_mock,
+        enqueue_coach_mock,
+    ):
+        resolve_media_mock.return_value = {
+            "audio_path": "sample.wav",
+            "video_path": "sample.mp4",
+            "source": "sample_fallback",
+            "fallback_reason": "missing_session_video",
+        }
+        run_pipeline_mock.return_value = {
+            "canonical_payload": {
+                "aligned_table": [{"word": "Hi", "start_sec": 0.1, "end_sec": 0.3}],
+                "events": [{"event_id": 1, "event_type": "steady_pacing", "start_sec": 0.2, "end_sec": 0.4}],
+            }
+        }
+        persist_mock.return_value = {
+            "session_uuid": str(self.session.id),
+            "written": True,
+            "reason": "",
+            "overall_rows": 1,
+            "aligned_rows": 1,
+            "event_rows": 1,
+        }
+        enqueue_coach_mock.side_effect = RuntimeError("coach enqueue failed")
+
+        with self.assertRaises(RuntimeError):
+            run_session_ml_workflow_task(session_id=str(self.session.id))
+
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, SessionStatus.COACH_FAILED)
+
+
 class CoachingSessionApiTests(TestCase):
     @classmethod
     def setUpClass(cls):
@@ -1288,6 +1531,7 @@ class CoachingSessionApiTests(TestCase):
         self.assertEqual(response.data["coach_progress"]["agent_progress"], [])
         self.assertEqual(response.data["coach_progress"]["stages"], [])
         self.assertEqual(response.data["coach_progress"]["latest_ledger_sequence"], 0)
+        self.assertEqual(response.data["coach_progress"]["ledger_entries"], [])
 
     def test_get_session_returns_404_for_non_owner(self):
         session = CoachingSession.objects.create(user=self.other_user)
@@ -1409,6 +1653,12 @@ class CoachingSessionApiTests(TestCase):
             coach_progress["stages"][1]["notes"][0]["evidence_refs"],
             ["01:00-01:40"],
         )
+        self.assertEqual(len(coach_progress["ledger_entries"]), 1)
+        self.assertEqual(coach_progress["ledger_entries"][0]["sequence"], 5)
+        self.assertEqual(
+            coach_progress["ledger_entries"][0]["content"],
+            "Confidence improved over the final minute.",
+        )
 
     @patch("sessions.serializers.get_live_ledger_latest_sequence")
     @patch("sessions.serializers.read_live_ledger_slice")
@@ -1473,6 +1723,58 @@ class CoachingSessionApiTests(TestCase):
             coach_progress["stages"][0]["notes"][0]["evidence_refs"],
             ["00:10-00:25"],
         )
+        self.assertEqual(len(coach_progress["ledger_entries"]), 1)
+        self.assertEqual(
+            coach_progress["ledger_entries"][0]["content"],
+            "Pacing improved in the second half.",
+        )
+        self.assertEqual(coach_progress["ledger_entries"][0]["sequence"], 4)
+
+    def test_get_session_timeline_returns_empty_array_when_no_events(self):
+        session = CoachingSession.objects.create(
+            user=self.user,
+            status=SessionStatus.DRAFT,
+        )
+        timeline_url = reverse("api:session-timeline", kwargs={"id": session.id})
+
+        response = self.client.get(timeline_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data, [])
+
+    def test_get_session_timeline_returns_annotations_from_session_events(self):
+        session = CoachingSession.objects.create(
+            user=self.user,
+            status=SessionStatus.ML_READY,
+            video_file="sessions/videos/2026/03/08/demo.mp4",
+        )
+        SessionEvent.objects.create(
+            session=session,
+            event_id=7,
+            start_time=1.2,
+            end_time=2.6,
+            event_json={
+                "event_type": "hesitation",
+                "source": "audio",
+                "confidence": 0.78,
+                "severity": "high",
+                "summary": "Hesitation spike during transition",
+            },
+        )
+
+        timeline_url = reverse("api:session-timeline", kwargs={"id": session.id})
+        response = self.client.get(timeline_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data), 1)
+        first = response.data[0]
+        self.assertEqual(first["event_type"], "hesitation")
+        self.assertEqual(first["source"], "audio")
+        self.assertEqual(first["start_ms"], 1200)
+        self.assertEqual(first["end_ms"], 2600)
+        self.assertEqual(first["severity"], "high")
+        self.assertEqual(first["summary"], "Hesitation spike during transition")
+        self.assertEqual(first["metadata"]["event_type"], "hesitation")
 
     def test_upload_video_moves_session_to_media_attached(self):
         session = CoachingSession.objects.create(user=self.user, status=SessionStatus.DRAFT)
@@ -1632,3 +1934,62 @@ class CoachingSessionApiTests(TestCase):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertIn("supplementary_pdf_1", response.data)
+
+    @patch("sessions.views.enqueue_session_ml_workflow_job")
+    def test_start_analysis_moves_media_attached_to_queued_ml(
+        self,
+        enqueue_mock,
+    ):
+        enqueue_mock.return_value = SimpleNamespace(id="ml-task-1")
+        session = CoachingSession.objects.create(
+            user=self.user,
+            status=SessionStatus.MEDIA_ATTACHED,
+            video_file="sessions/videos/2026/03/08/demo.mp4",
+        )
+        url = reverse("api:session-start-analysis", kwargs={"id": session.id})
+
+        response = self.client.post(url, {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        session.refresh_from_db()
+        self.assertEqual(session.status, SessionStatus.QUEUED_ML)
+        self.assertEqual(session.ml_task_id, "ml-task-1")
+        self.assertIsNone(session.coach_task_id)
+        self.assertEqual(response.data["status"], SessionStatus.QUEUED_ML)
+        self.assertEqual(response.data["ml_task_id"], "ml-task-1")
+        enqueue_mock.assert_called_once_with(session_id=str(session.id))
+
+    @patch("sessions.views.enqueue_session_ml_workflow_job")
+    def test_start_analysis_allows_retry_from_coach_failed(
+        self,
+        enqueue_mock,
+    ):
+        enqueue_mock.return_value = SimpleNamespace(id="ml-task-2")
+        session = CoachingSession.objects.create(
+            user=self.user,
+            status=SessionStatus.COACH_FAILED,
+            video_file="sessions/videos/2026/03/08/demo.mp4",
+            coach_task_id="old-coach-task",
+        )
+        url = reverse("api:session-start-analysis", kwargs={"id": session.id})
+
+        response = self.client.post(url, {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        session.refresh_from_db()
+        self.assertEqual(session.status, SessionStatus.QUEUED_ML)
+        self.assertEqual(session.ml_task_id, "ml-task-2")
+        self.assertIsNone(session.coach_task_id)
+
+    @patch("sessions.views.enqueue_session_ml_workflow_job")
+    def test_start_analysis_requires_media_attached_or_coach_failed(
+        self,
+        enqueue_mock,
+    ):
+        session = CoachingSession.objects.create(user=self.user, status=SessionStatus.DRAFT)
+        url = reverse("api:session-start-analysis", kwargs={"id": session.id})
+
+        response = self.client.post(url, {}, format="json")
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        enqueue_mock.assert_not_called()

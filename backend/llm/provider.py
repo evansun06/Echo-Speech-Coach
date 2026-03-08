@@ -7,8 +7,8 @@ from django.conf import settings
 
 from .schemas import ReasoningRole
 
-DEFAULT_SUBAGENT_MODEL = "gemini-2.0-flash"
-DEFAULT_PRIMARY_MODEL = "gemini-3.0-pro"
+DEFAULT_SUBAGENT_MODEL = "gemini-2.5-flash"
+DEFAULT_PRIMARY_MODEL = "gemini-2.5-flash"
 DEFAULT_SUBAGENT_TEMPERATURE = 0.2
 DEFAULT_PRIMARY_TEMPERATURE = 0.1
 

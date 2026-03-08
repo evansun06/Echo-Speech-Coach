@@ -34,6 +34,8 @@ from .live_ledger import (
 from .orchestrator import run_subagent_structured_reasoning
 
 SUBAGENT_OUTPUT_SCHEMA: dict[str, Any] = {
+    "title": "subagent_window_output",
+    "description": "Structured note payload for one subagent window.",
     "type": "object",
     "properties": {
         "notes": {

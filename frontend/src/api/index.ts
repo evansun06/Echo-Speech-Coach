@@ -1,6 +1,21 @@
+function readBooleanEnv(value: string | undefined, defaultValue: boolean): boolean {
+  if (value === undefined) {
+    return defaultValue
+  }
+  const normalized = value.trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+    return true
+  }
+  if (['0', 'false', 'no', 'off'].includes(normalized)) {
+    return false
+  }
+  return defaultValue
+}
+
+// Hackathon hard-switch: force real backend paths, ignore Vite mock/demo flags.
 export const CHAT_USE_MOCK = false
 export const SESSIONS_USE_MOCK = false
-export const DEMO_AI_WALKTHROUGH = true
+export const DEMO_AI_WALKTHROUGH = false
 const AUTH_USE_MOCK = false
 export const API_BASE_URL = 'http://localhost:8000'
 
@@ -60,6 +75,18 @@ export interface CoachAgentProgress {
   last_heartbeat_at: string | null
 }
 
+export interface CoachLedgerEntry {
+  sequence: number
+  entry_kind: string
+  agent_kind: 'subagent' | 'flagship_periodic' | 'flagship_final' | null
+  agent_name: string
+  window_start_ms: number | null
+  window_end_ms: number | null
+  content: string
+  payload: Record<string, unknown>
+  created_at: string
+}
+
 export interface CoachProgress {
   status: CoachProgressStatus
   current_stage: string
@@ -69,6 +96,7 @@ export interface CoachProgress {
   updated_at?: string
   agent_progress?: CoachAgentProgress[]
   stages: CoachStage[]
+  ledger_entries?: CoachLedgerEntry[]
 }
 
 export interface Annotation {

@@ -35,6 +35,8 @@ from .orchestrator import run_primary_structured_reasoning
 from .subagent_workflow import finalize_subagent_run
 
 FLAGSHIP_FINAL_OUTPUT_SCHEMA: dict[str, Any] = {
+    "title": "flagship_final_output",
+    "description": "Structured final coaching reconciliation payload.",
     "type": "object",
     "properties": {
         "overall_impression": {"type": "string"},

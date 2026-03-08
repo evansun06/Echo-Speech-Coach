@@ -1,11 +1,44 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 from functools import partial
 from typing import Any
 
 from .provider import ReasoningModels, get_reasoning_model
 from .schemas import ReasoningInput, ReasoningResult, ReasoningState
+
+logger = logging.getLogger(__name__)
+_TOOL_NAME_SAFE_CHARS = re.compile(r"[^A-Za-z0-9_.:-]")
+_TOOL_NAME_VALID = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,63}$")
+
+
+def _sanitize_tool_name(*, candidate: str, fallback: str) -> str:
+    """Normalize structured-output tool names to Gemini-valid identifier format."""
+    normalized = _TOOL_NAME_SAFE_CHARS.sub("_", str(candidate or "").strip())
+    if not normalized:
+        normalized = fallback
+    if not re.match(r"^[A-Za-z_]", normalized):
+        normalized = f"_{normalized}"
+    normalized = normalized[:64]
+    if _TOOL_NAME_VALID.match(normalized):
+        return normalized
+    return fallback
+
+
+def _prepare_structured_schema(*, schema: dict[str, Any], role: str) -> dict[str, Any]:
+    """Return schema copy with guaranteed valid title used for tool declaration name."""
+    prepared = dict(schema)
+    fallback_title = "subagent_window_output" if role == "subagent" else "primary_output"
+    title = _sanitize_tool_name(
+        candidate=str(prepared.get("title", "")),
+        fallback=fallback_title,
+    )
+    prepared["title"] = title
+    if not isinstance(prepared.get("description"), str) or not prepared.get("description", "").strip():
+        prepared["description"] = f"Structured {role} response payload."
+    return prepared
 
 
 def _normalize_response_content(content: Any) -> str:
@@ -89,9 +122,29 @@ def _invoke_reasoning_model(
 
     structured_schema = state.get("structured_schema")
     if isinstance(structured_schema, dict):
-        structured_response = model.with_structured_output(schema=structured_schema).invoke(
-            messages
+        prepared_schema = _prepare_structured_schema(schema=structured_schema, role=role)
+        logger.info(
+            "Structured output schema prepared | role=%s schema_title=%s",
+            role,
+            prepared_schema.get("title", ""),
         )
+        try:
+            structured_response = model.with_structured_output(schema=prepared_schema).invoke(
+                messages
+            )
+        except Exception as exc:
+            error_text = str(exc)
+            if "Invalid function name" not in error_text:
+                raise
+            logger.warning(
+                "Structured function_calling failed; retrying with json_mode | role=%s schema_title=%s",
+                role,
+                prepared_schema.get("title", ""),
+            )
+            structured_response = model.with_structured_output(
+                schema=prepared_schema,
+                method="json_mode",
+            ).invoke(messages)
         structured_output = _normalize_structured_output(structured_response)
         output_text = json.dumps(structured_output, sort_keys=True)
         usage = _normalize_usage(structured_response)

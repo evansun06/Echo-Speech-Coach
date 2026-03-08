@@ -29,3 +29,13 @@ docker compose down
 npm install
 npm run dev
 ```
+
+## Runtime Flags
+
+The API layer defaults to real backend mode. Optional Vite flags:
+
+```bash
+VITE_DEMO_AI_WALKTHROUGH=false
+VITE_SESSIONS_USE_MOCK=false
+VITE_CHAT_USE_MOCK=false
+```

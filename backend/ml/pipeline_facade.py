@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import time
 import traceback
 import uuid
@@ -26,6 +27,8 @@ except ImportError:
     from .mp_features import aggregate_windows, compute_overall_features, extract_frame_features
     from .os_features import SpeechFeatureExtractor
     from .stt_features import compute_overall_transcript_metrics, transcribe_words_google
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -81,24 +84,50 @@ def _save_table(df: pd.DataFrame, path: Path) -> None:
     df.to_csv(path, index=False)
 
 
-def _run_stage(stage_name: str, fn, stage_results: list[StageResult]) -> Any:
+def _run_stage(
+    stage_name: str,
+    fn,
+    stage_results: list[StageResult],
+    *,
+    session_uuid: str,
+) -> Any:
     t0 = time.time()
     try:
+        logger.info(
+            "ML stage started | session_id=%s stage=%s",
+            session_uuid,
+            stage_name,
+        )
         out = fn()
+        duration = round(time.time() - t0, 3)
         stage_results.append(
-            StageResult(name=stage_name, status="ok", duration_sec=round(time.time() - t0, 3))
+            StageResult(name=stage_name, status="ok", duration_sec=duration)
+        )
+        logger.info(
+            "ML stage completed | session_id=%s stage=%s duration_sec=%.3f",
+            session_uuid,
+            stage_name,
+            duration,
         )
         return out
     except Exception as exc:
+        duration = round(time.time() - t0, 3)
         stage_results.append(
             StageResult(
                 name=stage_name,
                 status="failed",
-                duration_sec=round(time.time() - t0, 3),
+                duration_sec=duration,
                 error_type=type(exc).__name__,
                 error_message=str(exc),
                 traceback_snippet=traceback.format_exc(limit=6),
             )
+        )
+        logger.exception(
+            "ML stage failed | session_id=%s stage=%s duration_sec=%.3f error_type=%s",
+            session_uuid,
+            stage_name,
+            duration,
+            type(exc).__name__,
         )
         raise
 
@@ -299,6 +328,14 @@ def run_pipeline(
 
     stage_results: list[StageResult] = []
     generated_at = _now_iso()
+    pipeline_t0 = time.time()
+    logger.info(
+        "ML pipeline started | session_id=%s audio_path=%s video_path=%s run_dir=%s",
+        session_uuid,
+        str(Path(audio_path).resolve()),
+        str(Path(video_path).resolve()),
+        str(run_dir.resolve()),
+    )
 
     try:
         # 1) STT
@@ -310,13 +347,19 @@ def run_pipeline(
                 sample_rate_hz=sample_rate_hz,
             ),
             stage_results,
+            session_uuid=session_uuid,
         )
         stt_overall = _run_stage(
             "stt_overall",
             lambda: compute_overall_transcript_metrics(word_df),
             stage_results,
+            session_uuid=session_uuid,
         )
-        print(f"[STT] done: words={len(word_df)}")
+        logger.info(
+            "ML STT summary | session_id=%s words=%s",
+            session_uuid,
+            len(word_df),
+        )
 
         # 2) OpenSMILE
         extractor = SpeechFeatureExtractor(interval_seconds=os_interval_sec)
@@ -324,32 +367,46 @@ def run_pipeline(
             "opensmile_intervals",
             lambda: extractor.extract_interval_features(audio_path),
             stage_results,
+            session_uuid=session_uuid,
         )
         os_overall = _run_stage(
             "opensmile_overall",
             lambda: extractor.extract_overall_features(audio_path),
             stage_results,
+            session_uuid=session_uuid,
         )
-        print(f"[OpenSMILE] done: intervals={len(os_interval_df)}")
+        logger.info(
+            "ML OpenSMILE summary | session_id=%s intervals=%s",
+            session_uuid,
+            len(os_interval_df),
+        )
 
         # 3) MediaPipe
         frame_df, effective_fps = _run_stage(
             "mediapipe_frame_features",
             lambda: extract_frame_features(video_path),
             stage_results,
+            session_uuid=session_uuid,
         )
         mp_window_df = _run_stage(
             "mediapipe_windows",
             lambda: aggregate_windows(frame_df, window_sec=mp_window_sec),
             stage_results,
+            session_uuid=session_uuid,
         )
         mp_overall = _run_stage(
             "mediapipe_overall",
             lambda: compute_overall_features(frame_df, mp_window_df),
             stage_results,
+            session_uuid=session_uuid,
         )
         mp_overall["effective_fps"] = float(effective_fps)
-        print(f"[MediaPipe] done: windows={len(mp_window_df)}, fps={effective_fps:.2f}")
+        logger.info(
+            "ML MediaPipe summary | session_id=%s windows=%s effective_fps=%.2f",
+            session_uuid,
+            len(mp_window_df),
+            effective_fps,
+        )
 
         # 4) Alignment
         aligned_df = _run_stage(
@@ -360,16 +417,26 @@ def run_pipeline(
                 mediapipe_df=mp_window_df,
             ),
             stage_results,
+            session_uuid=session_uuid,
         )
-        print(f"[Fusion] done: aligned_rows={len(aligned_df)}")
+        logger.info(
+            "ML fusion summary | session_id=%s aligned_rows=%s",
+            session_uuid,
+            len(aligned_df),
+        )
 
         # 5) Events
         _, events_df = _run_stage(
             "event_detection",
             lambda: compute_events(aligned_df),
             stage_results,
+            session_uuid=session_uuid,
         )
-        print(f"[Events] done: events={len(events_df)}")
+        logger.info(
+            "ML events summary | session_id=%s events=%s",
+            session_uuid,
+            len(events_df),
+        )
 
         # Save minimal debugging artifacts
         _save_table(aligned_df, run_dir / "aligned.csv")
@@ -389,7 +456,11 @@ def run_pipeline(
         )
 
         _save_json(canonical_payload, run_dir / "canonical_payload.json")
-        print(f"[Artifacts] done: saved to {run_dir}")
+        logger.info(
+            "ML artifacts saved | session_id=%s run_dir=%s",
+            session_uuid,
+            str(run_dir.resolve()),
+        )
 
         run_report = {
             "meta": {
@@ -406,6 +477,12 @@ def run_pipeline(
             },
         }
         _save_json(run_report, run_dir / "run_report.json")
+        logger.info(
+            "ML pipeline completed | session_id=%s duration_sec=%.3f run_report=%s",
+            session_uuid,
+            round(time.time() - pipeline_t0, 3),
+            str((run_dir / "run_report.json").resolve()),
+        )
 
         return {
             "status": "ok",
@@ -430,6 +507,14 @@ def run_pipeline(
             "stages": [_sanitize(s.__dict__) for s in stage_results],
         }
         _save_json(run_report, run_dir / "run_report.json")
+        logger.exception(
+            "ML pipeline failed | session_id=%s failed_stage=%s duration_sec=%.3f run_report=%s error_type=%s",
+            session_uuid,
+            failed_stage,
+            round(time.time() - pipeline_t0, 3),
+            str((run_dir / "run_report.json").resolve()),
+            type(exc).__name__,
+        )
         raise
 
 
