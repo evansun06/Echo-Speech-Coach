@@ -66,7 +66,7 @@ class CoachingSession(models.Model):
         null=True,
         blank=True,
         validators=[
-            FileExtensionValidator(allowed_extensions=["mp4"]),
+            FileExtensionValidator(allowed_extensions=["mp4", "webm"]),
             MaxFileSizeValidator(
                 max_bytes=MAX_VIDEO_FILE_SIZE_BYTES,
                 label="Video file",

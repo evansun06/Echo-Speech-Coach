@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   Alert,
   Box,
@@ -19,7 +19,7 @@ import {
   Typography,
 } from '@mui/material'
 import { useNavigate } from 'react-router-dom'
-import api, { SESSIONS_USE_MOCK } from '../api'
+import api from '../api'
 import type { ApiError, CoachingSessionListItem, SessionAssetsPayload } from '../api'
 
 type VideoSource = 'upload' | 'record'
@@ -65,6 +65,12 @@ function formatStatusLabel(status: string): string {
 
 function HomePage() {
   const navigate = useNavigate()
+  const cameraPreviewRef = useRef<HTMLVideoElement | null>(null)
+  const mediaStreamRef = useRef<MediaStream | null>(null)
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const recordedChunksRef = useRef<Blob[]>([])
+  const recordingTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
   const [sessions, setSessions] = useState<CoachingSessionListItem[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -79,6 +85,9 @@ function HomePage() {
   const [supportingText, setSupportingText] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [modalError, setModalError] = useState<string | null>(null)
+  const [isCameraLoading, setIsCameraLoading] = useState(false)
+  const [isRecording, setIsRecording] = useState(false)
+  const [recordingDurationSeconds, setRecordingDurationSeconds] = useState(0)
 
   useEffect(() => {
     let isMounted = true
@@ -126,7 +135,246 @@ function HomePage() {
     }
   }
 
+  const clearRecordingTimer = () => {
+    if (recordingTimerRef.current) {
+      clearInterval(recordingTimerRef.current)
+      recordingTimerRef.current = null
+    }
+  }
+
+  const getMediaErrorMessage = (error: unknown): string => {
+    if (error instanceof DOMException) {
+      if (error.name === 'NotAllowedError') {
+        return 'Camera/microphone permission was denied. Allow access and try again.'
+      }
+      if (error.name === 'NotFoundError') {
+        return 'No camera device was found.'
+      }
+      if (error.name === 'NotReadableError') {
+        return 'Camera is currently in use by another application.'
+      }
+      return error.message || 'Unable to initialize camera preview.'
+    }
+
+    if (error instanceof Error) {
+      return error.message || 'Unable to initialize camera preview.'
+    }
+
+    return 'Unable to initialize camera preview.'
+  }
+
+  const waitForPreviewElement = async (): Promise<HTMLVideoElement> => {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      if (cameraPreviewRef.current) {
+        return cameraPreviewRef.current
+      }
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, 50)
+      })
+    }
+
+    throw new Error('Camera preview is not ready yet.')
+  }
+
+  const attachStreamToPreview = async (stream: MediaStream): Promise<void> => {
+    const previewElement = await waitForPreviewElement()
+
+    const videoTrack = stream.getVideoTracks()[0]
+    if (!videoTrack || videoTrack.readyState !== 'live') {
+      throw new Error('Camera video track is unavailable.')
+    }
+
+    previewElement.srcObject = stream
+    await previewElement.play()
+  }
+
+  const cleanupRecordingResources = () => {
+    clearRecordingTimer()
+
+    const mediaRecorder = mediaRecorderRef.current
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+      mediaRecorder.ondataavailable = null
+      mediaRecorder.onstop = null
+      mediaRecorder.onerror = null
+      mediaRecorder.stop()
+    }
+    mediaRecorderRef.current = null
+
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => {
+        track.stop()
+      })
+      mediaStreamRef.current = null
+    }
+
+    if (cameraPreviewRef.current) {
+      cameraPreviewRef.current.srcObject = null
+    }
+
+    recordedChunksRef.current = []
+    setIsCameraLoading(false)
+    setIsRecording(false)
+    setRecordingDurationSeconds(0)
+  }
+
+  const startCameraPreview = async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setModalError('Camera access is not supported in this browser.')
+      return
+    }
+
+    if (mediaStreamRef.current) {
+      try {
+        await attachStreamToPreview(mediaStreamRef.current)
+      } catch (error) {
+        setModalError(getMediaErrorMessage(error))
+      }
+      return
+    }
+
+    setIsCameraLoading(true)
+
+    try {
+      let stream: MediaStream
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: true,
+        })
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: true,
+          audio: false,
+        })
+      }
+
+      mediaStreamRef.current = stream
+      stream.getVideoTracks().forEach((track) => {
+        track.enabled = true
+      })
+
+      try {
+        await attachStreamToPreview(stream)
+      } catch (error) {
+        stream.getTracks().forEach((track) => {
+          track.stop()
+        })
+        mediaStreamRef.current = null
+        throw error
+      }
+
+      setModalError(null)
+    } catch (error) {
+      setModalError(getMediaErrorMessage(error))
+    } finally {
+      setIsCameraLoading(false)
+    }
+  }
+
+  const handleStartRecording = () => {
+    if (isRecording) {
+      return
+    }
+
+    if (typeof MediaRecorder === 'undefined') {
+      setModalError('Recording is not supported in this browser.')
+      return
+    }
+
+    const stream = mediaStreamRef.current
+    if (!stream) {
+      setModalError('Camera is not ready. Wait for preview before recording.')
+      return
+    }
+
+    try {
+      const supportedMimeTypes = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
+      const mimeType =
+        supportedMimeTypes.find((candidate) => typeof MediaRecorder.isTypeSupported === 'function' && MediaRecorder.isTypeSupported(candidate)) ||
+        ''
+
+      const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream)
+      recordedChunksRef.current = []
+      setVideoFile(null)
+      setRecordingDurationSeconds(0)
+      setModalError(null)
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          recordedChunksRef.current.push(event.data)
+        }
+      }
+
+      recorder.onerror = () => {
+        setModalError('Recording failed. Please try again.')
+        clearRecordingTimer()
+        setIsRecording(false)
+      }
+
+      recorder.onstop = () => {
+        const blob = new Blob(recordedChunksRef.current, { type: recorder.mimeType || 'video/webm' })
+        if (blob.size === 0) {
+          setModalError('No video was captured. Please record again.')
+          return
+        }
+
+        const recordedFile = new File([blob], `recording-${Date.now()}.webm`, {
+          type: blob.type || 'video/webm',
+        })
+
+        setVideoFile(recordedFile)
+        setModalError(null)
+      }
+
+      mediaRecorderRef.current = recorder
+      recorder.start()
+      setIsRecording(true)
+
+      clearRecordingTimer()
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingDurationSeconds((previous) => previous + 1)
+      }, 1000)
+    } catch {
+      setModalError('Unable to start recording. Please try again.')
+    }
+  }
+
+  const handleStopRecording = () => {
+    const recorder = mediaRecorderRef.current
+    if (!recorder || recorder.state !== 'recording') {
+      return
+    }
+
+    recorder.stop()
+    setIsRecording(false)
+    clearRecordingTimer()
+  }
+
+  useEffect(() => {
+    if (!isModalOpen || modalStep !== 2 || videoSource !== 'record') {
+      cleanupRecordingResources()
+      return
+    }
+
+    let isCancelled = false
+
+    const bootCameraPreview = async () => {
+      await startCameraPreview()
+      if (isCancelled) {
+        cleanupRecordingResources()
+      }
+    }
+
+    void bootCameraPreview()
+
+    return () => {
+      isCancelled = true
+      cleanupRecordingResources()
+    }
+  }, [isModalOpen, modalStep, videoSource])
+
   const resetModalState = () => {
+    cleanupRecordingResources()
     setModalStep(1)
     setVideoSource(null)
     setSessionName('')
@@ -218,8 +466,8 @@ function HomePage() {
       return
     }
 
-    if (videoSource === 'record' && !SESSIONS_USE_MOCK) {
-      setModalError('Record Now is coming soon. Please use Upload Video for now.')
+    if (videoSource === 'record' && !videoFile) {
+      setModalError('Record and stop your video before confirming.')
       return
     }
 
@@ -230,7 +478,7 @@ function HomePage() {
       const createResponse = await api.sessions.create(trimmedSessionName)
       const sessionId = createResponse.id
 
-      await api.sessions.uploadVideo(sessionId, videoSource === 'upload' ? videoFile : null)
+      await api.sessions.uploadVideo(sessionId, videoFile)
 
       const optionalAssets: SessionAssetsPayload = {
         pdfFiles: supportingPdfFiles,
@@ -400,24 +648,92 @@ function HomePage() {
                 />
 
                 <Stack spacing={1}>
-                  <Typography variant="h6">Upload your presentation video</Typography>
-                  <Button component="label" variant="outlined" sx={{ alignSelf: 'flex-start' }}>
-                    Choose Video
-                    <input hidden type="file" accept="video/*" onChange={handleVideoFileChange} />
-                  </Button>
-                  <Typography color="text.secondary" variant="body2">
-                    {videoFile ? `Selected: ${videoFile.name}` : 'No file selected'}
-                  </Typography>
-                  <Typography color="text.secondary" variant="caption">
-                    One video per session. Multiple uploads are not allowed.
-                  </Typography>
-                </Stack>
+                  {videoSource === 'upload' ? (
+                    <>
+                      <Typography variant="h6">Upload your presentation video</Typography>
+                      <Button component="label" variant="outlined" sx={{ alignSelf: 'flex-start' }}>
+                        Choose Video
+                        <input hidden type="file" accept="video/*" onChange={handleVideoFileChange} />
+                      </Button>
+                      <Typography color="text.secondary" variant="body2">
+                        {videoFile ? `Selected: ${videoFile.name}` : 'No file selected'}
+                      </Typography>
+                      <Typography color="text.secondary" variant="caption">
+                        One video per session. Multiple uploads are not allowed.
+                      </Typography>
+                    </>
+                  ) : (
+                    <>
+                      <Typography variant="h6">Record your presentation video</Typography>
+                      <Box
+                        sx={{
+                          position: 'relative',
+                          border: '1px solid',
+                          borderColor: 'divider',
+                          borderRadius: 2,
+                          overflow: 'hidden',
+                          bgcolor: 'common.black',
+                          minHeight: 220,
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                        }}
+                      >
+                        <video
+                          ref={cameraPreviewRef}
+                          autoPlay
+                          muted
+                          playsInline
+                          style={{
+                            width: '100%',
+                            minHeight: 220,
+                            maxHeight: 360,
+                            display: 'block',
+                            objectFit: 'cover',
+                            backgroundColor: '#000',
+                          }}
+                        />
+                        {isCameraLoading && (
+                          <Box
+                            sx={{
+                              position: 'absolute',
+                              inset: 0,
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              bgcolor: 'rgba(0, 0, 0, 0.5)',
+                            }}
+                          >
+                            <CircularProgress />
+                          </Box>
+                        )}
+                      </Box>
 
-                {videoSource === 'record' && (
-                  <Alert severity="info">
-                    Record Now is still a placeholder. In mock mode you can continue without uploading a video file.
-                  </Alert>
-                )}
+                      <Stack direction="row" spacing={1}>
+                        <Button
+                          variant="contained"
+                          onClick={handleStartRecording}
+                          disabled={isRecording || isCameraLoading || isSubmitting}
+                        >
+                          Record
+                        </Button>
+                        <Button variant="outlined" onClick={handleStopRecording} disabled={!isRecording || isSubmitting}>
+                          Stop
+                        </Button>
+                      </Stack>
+
+                      <Typography color="text.secondary" variant="body2">
+                        {isRecording ? `Recording: ${formatDuration(recordingDurationSeconds)}` : 'Not recording'}
+                      </Typography>
+                      <Typography color="text.secondary" variant="body2">
+                        {videoFile ? `Recorded: ${videoFile.name}` : 'No recording captured yet'}
+                      </Typography>
+                      <Typography color="text.secondary" variant="caption">
+                        One video per session. Multiple uploads are not allowed.
+                      </Typography>
+                    </>
+                  )}
+                </Stack>
 
                 <Stack spacing={1}>
                   <Typography variant="subtitle2">Supporting materials (optional)</Typography>

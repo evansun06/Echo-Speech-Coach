@@ -144,7 +144,7 @@ class CoachingSessionModelTests(TestCase):
         with self.assertRaises(ValidationError):
             session.full_clean()
 
-    def test_video_file_rejects_non_mp4_extension(self):
+    def test_video_file_rejects_non_supported_extension(self):
         session = CoachingSession(
             user=self.user,
             video_file=SimpleUploadedFile("recording.mov", b"fake-video"),
@@ -154,6 +154,14 @@ class CoachingSessionModelTests(TestCase):
             session.full_clean()
 
         self.assertIn("video_file", error.exception.message_dict)
+
+    def test_video_file_accepts_webm_extension(self):
+        session = CoachingSession(
+            user=self.user,
+            video_file=SimpleUploadedFile("recording.webm", b"fake-video"),
+        )
+
+        session.full_clean()
 
     def test_supplementary_pdf_rejects_non_pdf_extension(self):
         session = CoachingSession(
@@ -249,8 +257,10 @@ class CoachingSessionApiTests(TestCase):
         self.unauthenticated_client = APIClient()
         self.collection_url = reverse("api:sessions-collection")
 
-    def _video_file(self, *, name: str = "recording.mp4") -> SimpleUploadedFile:
-        return SimpleUploadedFile(name, b"fake-video", content_type="video/mp4")
+    def _video_file(
+        self, *, name: str = "recording.mp4", content_type: str = "video/mp4"
+    ) -> SimpleUploadedFile:
+        return SimpleUploadedFile(name, b"fake-video", content_type=content_type)
 
     def _pdf_file(self, *, name: str = "slides.pdf") -> SimpleUploadedFile:
         return SimpleUploadedFile(name, b"fake-pdf", content_type="application/pdf")
@@ -379,6 +389,27 @@ class CoachingSessionApiTests(TestCase):
         session.refresh_from_db()
         self.assertEqual(session.status, SessionStatus.MEDIA_ATTACHED)
         self.assertTrue(session.video_file.name.endswith(".mp4"))
+        self.assertEqual(response.data["status"], SessionStatus.MEDIA_ATTACHED)
+
+    def test_upload_video_accepts_webm_extension(self):
+        session = CoachingSession.objects.create(user=self.user, status=SessionStatus.DRAFT)
+        video_url = reverse("api:session-video", kwargs={"id": session.id})
+
+        response = self.client.post(
+            video_url,
+            {
+                "video_file": self._video_file(
+                    name="recording.webm",
+                    content_type="video/webm",
+                )
+            },
+            format="multipart",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        session.refresh_from_db()
+        self.assertEqual(session.status, SessionStatus.MEDIA_ATTACHED)
+        self.assertTrue(session.video_file.name.endswith(".webm"))
         self.assertEqual(response.data["status"], SessionStatus.MEDIA_ATTACHED)
 
     def test_upload_video_requires_draft_status(self):
