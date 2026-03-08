@@ -579,7 +579,8 @@ function ChatPanel({ sessionId, sessionStatus }: { sessionId: string; sessionSta
     }
   }
 
-  const showStreamingAssistant = isSending && (streamingReasoning.length > 0 || streamingAnswer.length > 0)
+  const hasStreamingReasoning = streamingReasoning.trim().length > 0
+  const showStreamingAssistant = isSending && streamingAnswer.length > 0
 
   return (
     <Stack spacing={1.5} sx={{ height: '100%' }}>
@@ -663,20 +664,22 @@ function ChatPanel({ sessionId, sessionStatus }: { sessionId: string; sessionSta
                       Coach • {formatChatTimestamp(new Date().toISOString())}
                     </Typography>
 
-                    <Stack spacing={0.5}>
-                      <Button
-                        size="small"
-                        onClick={() => setStreamingReasoningCollapsed((previous) => !previous)}
-                        sx={{ alignSelf: 'flex-start', px: 0, minWidth: 0 }}
-                      >
-                        {streamingReasoningCollapsed ? 'Show Reasoning…' : 'Hide Reasoning…'}
-                      </Button>
-                      <Collapse in={!streamingReasoningCollapsed}>
-                        <Typography variant="body2" sx={{ fontStyle: 'italic', color: 'text.secondary' }}>
-                          {streamingReasoning || 'Reasoning...'}
-                        </Typography>
-                      </Collapse>
-                    </Stack>
+                    {hasStreamingReasoning && (
+                      <Stack spacing={0.5}>
+                        <Button
+                          size="small"
+                          onClick={() => setStreamingReasoningCollapsed((previous) => !previous)}
+                          sx={{ alignSelf: 'flex-start', px: 0, minWidth: 0 }}
+                        >
+                          {streamingReasoningCollapsed ? 'Show Reasoning…' : 'Hide Reasoning…'}
+                        </Button>
+                        <Collapse in={!streamingReasoningCollapsed}>
+                          <Typography variant="body2" sx={{ fontStyle: 'italic', color: 'text.secondary' }}>
+                            {streamingReasoning}
+                          </Typography>
+                        </Collapse>
+                      </Stack>
+                    )}
 
                     <Typography variant="body2">{streamingAnswer || 'Generating final answer...'}</Typography>
                   </Stack>

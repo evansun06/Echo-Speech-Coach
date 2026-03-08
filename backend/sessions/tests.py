@@ -45,7 +45,12 @@ from llm.ledger import (
     read_ledger_slice,
     touch_agent_heartbeat,
 )
-from llm.provider import ModelConfigurationError, ReasoningModels, build_reasoning_models
+from llm.provider import (
+    ModelConfigurationError,
+    ReasoningModels,
+    build_chat_model,
+    build_reasoning_models,
+)
 from llm.schemas import ReasoningInput, ReasoningResult
 from llm.subagent_workflow import (
     SUBAGENT_SYSTEM_PROMPT,
@@ -582,6 +587,32 @@ class GeminiReasoningProviderTests(SimpleTestCase):
         self.assertEqual(captured_configs[1]["google_api_key"], "test-api-key")
         self.assertEqual(captured_configs[0]["temperature"], 0.2)
         self.assertEqual(captured_configs[1]["temperature"], 0.1)
+
+    def test_build_chat_model_uses_configured_model_id(self):
+        captured_configs: list[dict[str, object]] = []
+
+        class FakeChatGoogleGenerativeAI:
+            def __init__(self, **kwargs):
+                captured_configs.append(kwargs)
+                self.model = kwargs.get("model")
+
+        fake_module = types.ModuleType("langchain_google_genai")
+        fake_module.ChatGoogleGenerativeAI = FakeChatGoogleGenerativeAI
+
+        with patch.dict(sys.modules, {"langchain_google_genai": fake_module}):
+            with override_settings(
+                GEMINI_API_KEY="test-api-key",
+                GEMINI_CHAT_MODEL="gemini-2.5-flash",
+                GEMINI_CHAT_TEMPERATURE=0.25,
+            ):
+                chat_model = build_chat_model()
+
+        self.assertEqual(chat_model.model_name, "gemini-2.5-flash")
+        self.assertEqual(chat_model.temperature, 0.25)
+        self.assertEqual(len(captured_configs), 1)
+        self.assertEqual(captured_configs[0]["model"], "gemini-2.5-flash")
+        self.assertEqual(captured_configs[0]["google_api_key"], "test-api-key")
+        self.assertEqual(captured_configs[0]["temperature"], 0.25)
 
 
 @unittest.skipUnless(

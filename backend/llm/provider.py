@@ -9,8 +9,10 @@ from .schemas import ReasoningRole
 
 DEFAULT_SUBAGENT_MODEL = "gemini-2.5-flash"
 DEFAULT_PRIMARY_MODEL = "gemini-2.5-flash"
+DEFAULT_CHAT_MODEL = "gemini-2.5-flash"
 DEFAULT_SUBAGENT_TEMPERATURE = 0.2
 DEFAULT_PRIMARY_TEMPERATURE = 0.1
+DEFAULT_CHAT_TEMPERATURE = 0.2
 
 
 class ModelConfigurationError(RuntimeError):
@@ -125,3 +127,60 @@ def get_reasoning_model(models: ReasoningModels, role: ReasoningRole):
     if role == "primary":
         return models.primary
     raise ValueError(f"Unsupported reasoning role: {role}")
+
+
+@dataclass(frozen=True, slots=True)
+class ChatModelConfig:
+    model: Any
+    model_name: str
+    temperature: float
+
+
+def build_chat_model(
+    *,
+    api_key: str | None = None,
+    model: str | None = None,
+    temperature: float | None = None,
+) -> ChatModelConfig:
+    """Create a configured Gemini chat model client for session chat streaming."""
+    resolved_api_key = _clean_string(
+        settings.GEMINI_API_KEY if api_key is None else api_key
+    )
+    resolved_model = _clean_string(
+        getattr(settings, "GEMINI_CHAT_MODEL", DEFAULT_CHAT_MODEL)
+        if model is None
+        else model
+    )
+    resolved_temperature = _resolve_temperature(
+        temperature
+        if temperature is not None
+        else getattr(
+            settings,
+            "GEMINI_CHAT_TEMPERATURE",
+            DEFAULT_CHAT_TEMPERATURE,
+        ),
+        DEFAULT_CHAT_TEMPERATURE,
+    )
+
+    if not resolved_api_key:
+        raise ModelConfigurationError("Missing Gemini API key. Set GEMINI_API_KEY.")
+    if not resolved_model:
+        raise ModelConfigurationError("Missing chat model ID. Set GEMINI_CHAT_MODEL.")
+
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+    except Exception as exc:  # pragma: no cover - import-path validation
+        raise ModelConfigurationError(
+            "langchain-google-genai is required to build chat models."
+        ) from exc
+
+    configured_model = ChatGoogleGenerativeAI(
+        model=resolved_model,
+        google_api_key=resolved_api_key,
+        temperature=resolved_temperature,
+    )
+    return ChatModelConfig(
+        model=configured_model,
+        model_name=resolved_model,
+        temperature=resolved_temperature,
+    )

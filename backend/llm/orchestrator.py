@@ -4,7 +4,7 @@ from functools import lru_cache
 from typing import Any
 
 from .coach_graph import build_reasoning_graph, run_reasoning_graph
-from .provider import build_reasoning_models
+from .provider import ChatModelConfig, build_chat_model, build_reasoning_models
 from .schemas import ReasoningInput, ReasoningResult
 
 
@@ -108,3 +108,61 @@ def run_primary_structured_reasoning(
         ),
         graph=graph,
     )
+
+
+@lru_cache(maxsize=1)
+def _cached_chat_model() -> ChatModelConfig:
+    """Build and cache the configured Gemini chat model."""
+    return build_chat_model()
+
+
+def clear_chat_model_cache() -> None:
+    """Clear the cached chat model so updated settings are picked up."""
+    _cached_chat_model.cache_clear()
+
+
+def _normalize_stream_chunk_content(content: Any) -> str:
+    """Convert streamed chunk content into plain text without stripping spacing."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                maybe_text = item.get("text")
+                if isinstance(maybe_text, str):
+                    parts.append(maybe_text)
+        return "".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def stream_chat_response_tokens(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    metadata: dict[str, Any] | None = None,
+    model_config: ChatModelConfig | None = None,
+):
+    """Yield streamed Gemini chat text chunks for one system+user prompt pair."""
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    resolved_model_config = model_config or _cached_chat_model()
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_prompt),
+    ]
+    stream_config = {"metadata": dict(metadata)} if metadata else None
+    chunk_stream = (
+        resolved_model_config.model.stream(messages, config=stream_config)
+        if stream_config is not None
+        else resolved_model_config.model.stream(messages)
+    )
+    for chunk in chunk_stream:
+        token = _normalize_stream_chunk_content(getattr(chunk, "content", ""))
+        if token:
+            yield token

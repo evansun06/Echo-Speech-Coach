@@ -43,6 +43,7 @@ celerybeat.pid
 .env.*
 !.env.example
 !.env.sample
+!.env.gemini.example
 
 # Node / frontend
 node_modules/
