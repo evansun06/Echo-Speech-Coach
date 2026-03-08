@@ -2,4 +2,5 @@ from django.apps import AppConfig
 
 
 class SessionsConfig(AppConfig):
-    name = 'sessions'
+    name = "sessions"
+    label = "coach_sessions"
