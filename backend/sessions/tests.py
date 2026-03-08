@@ -2,10 +2,21 @@ from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError
 from django.core.management import CommandError, call_command
-from django.test import SimpleTestCase
+from django.db import IntegrityError
+from django.test import SimpleTestCase, TestCase
+from django.core.files.uploadedfile import SimpleUploadedFile
 
 from ml.enqueue import enqueue_random_sleep_demo_job, enqueue_random_sleep_demo_jobs
+from sessions.models import (
+    MAX_SUPPLEMENTARY_PDF_FILE_SIZE_BYTES,
+    MAX_VIDEO_FILE_SIZE_BYTES,
+    CoachingSession,
+    MaxFileSizeValidator,
+    SessionStatus,
+)
 
 
 class DemoEnqueueWrapperTests(SimpleTestCase):
@@ -84,3 +95,108 @@ class EnqueueDemoJobsCommandTests(SimpleTestCase):
                 "--max-seconds",
                 "1",
             )
+
+
+class CoachingSessionModelTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            username="coach@example.com",
+            email="coach@example.com",
+            password="password123",
+        )
+
+    def test_session_defaults(self):
+        session = CoachingSession.objects.create(user=self.user)
+
+        self.assertEqual(session.status, SessionStatus.DRAFT)
+        self.assertEqual(session.speaker_context, "")
+        self.assertFalse(session.video_file)
+        self.assertIsNone(session.ml_task_id)
+        self.assertIsNone(session.coach_task_id)
+
+    def test_user_can_have_multiple_sessions(self):
+        first = CoachingSession.objects.create(user=self.user)
+        second = CoachingSession.objects.create(user=self.user)
+
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(
+            CoachingSession.objects.filter(user=self.user).count(),
+            2,
+        )
+
+    def test_status_choices_are_validated(self):
+        session = CoachingSession(user=self.user, status="invalid_status")
+
+        with self.assertRaises(ValidationError):
+            session.full_clean()
+
+    def test_video_file_rejects_non_mp4_extension(self):
+        session = CoachingSession(
+            user=self.user,
+            video_file=SimpleUploadedFile("recording.mov", b"fake-video"),
+        )
+
+        with self.assertRaises(ValidationError) as error:
+            session.full_clean()
+
+        self.assertIn("video_file", error.exception.message_dict)
+
+    def test_supplementary_pdf_rejects_non_pdf_extension(self):
+        session = CoachingSession(
+            user=self.user,
+            supplementary_pdf_1=SimpleUploadedFile("script.txt", b"fake-text"),
+        )
+
+        with self.assertRaises(ValidationError) as error:
+            session.full_clean()
+
+        self.assertIn("supplementary_pdf_1", error.exception.message_dict)
+
+    def test_max_file_size_validator_rejects_oversized_video(self):
+        validator = MaxFileSizeValidator(
+            max_bytes=MAX_VIDEO_FILE_SIZE_BYTES,
+            label="Video file",
+        )
+
+        with self.assertRaises(ValidationError):
+            validator(
+                SimpleNamespace(
+                    name="recording.mp4",
+                    size=MAX_VIDEO_FILE_SIZE_BYTES + 1,
+                )
+            )
+
+    def test_max_file_size_validator_rejects_oversized_pdf(self):
+        validator = MaxFileSizeValidator(
+            max_bytes=MAX_SUPPLEMENTARY_PDF_FILE_SIZE_BYTES,
+            label="Supplementary PDF",
+        )
+
+        with self.assertRaises(ValidationError):
+            validator(
+                SimpleNamespace(
+                    name="slides.pdf",
+                    size=MAX_SUPPLEMENTARY_PDF_FILE_SIZE_BYTES + 1,
+                )
+            )
+
+    def test_non_draft_status_requires_video(self):
+        with self.assertRaises(IntegrityError):
+            CoachingSession.objects.create(
+                user=self.user,
+                status=SessionStatus.MEDIA_ATTACHED,
+            )
+
+    def test_non_draft_status_allows_video(self):
+        session = CoachingSession.objects.create(
+            user=self.user,
+            status=SessionStatus.MEDIA_ATTACHED,
+            video_file="sessions/videos/2026/03/08/demo.mp4",
+        )
+
+        self.assertEqual(session.status, SessionStatus.MEDIA_ATTACHED)
+        self.assertEqual(
+            session.video_file.name,
+            "sessions/videos/2026/03/08/demo.mp4",
+        )
