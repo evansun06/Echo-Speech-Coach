@@ -20,7 +20,7 @@ The system is built for hackathon-speed execution with production-minded archite
 - React + MUI + TypeScript
 
 ### Backend
-- Django + Django REST Framework + Python 3.13
+- Django + Django REST Framework + Python 3.12
 
 ### Async + Data + Infra
 - Redis (broker/cache)
