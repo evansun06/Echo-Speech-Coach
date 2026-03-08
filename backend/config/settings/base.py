@@ -151,10 +151,26 @@ SPECTACULAR_SETTINGS = {
 CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://redis:6379/0")
 CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", "redis://redis:6379/1")
 CELERY_RESULT_EXPIRES = int(os.environ.get("CELERY_RESULT_EXPIRES", "3600"))
-CELERY_IMPORTS = ("ml.tasks",)
+CELERY_IMPORTS = ("ml.tasks", "llm.tasks")
 CELERY_TASK_TRACK_STARTED = _env_bool("CELERY_TASK_TRACK_STARTED", True)
 CELERY_WORKER_SEND_TASK_EVENTS = _env_bool("CELERY_WORKER_SEND_TASK_EVENTS", True)
 CELERY_TASK_SEND_SENT_EVENT = _env_bool("CELERY_TASK_SEND_SENT_EVENT", True)
 
+# LLM live-ledger storage
+LLM_LEDGER_REDIS_URL = os.environ.get("LLM_LEDGER_REDIS_URL", CELERY_BROKER_URL)
+LLM_LEDGER_REDIS_TTL_SECONDS = int(
+    os.environ.get("LLM_LEDGER_REDIS_TTL_SECONDS", "86400")
+)
+
 # Gemini
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_SUBAGENT_MODEL = os.getenv("GEMINI_SUBAGENT_MODEL", "gemini-2.0-flash")
+GEMINI_PRIMARY_MODEL = os.getenv("GEMINI_PRIMARY_MODEL", "gemini-3.0-pro")
+GEMINI_SUBAGENT_TEMPERATURE = float(os.getenv("GEMINI_SUBAGENT_TEMPERATURE", "0.2"))
+GEMINI_PRIMARY_TEMPERATURE = float(os.getenv("GEMINI_PRIMARY_TEMPERATURE", "0.1"))
+GEMINI_FLAGSHIP_FINAL_SYSTEM_PROMPT = os.getenv(
+    "GEMINI_FLAGSHIP_FINAL_SYSTEM_PROMPT",
+    "You are the final speech coaching synthesis model. Read the full ledger and "
+    "produce a concise overall impression, key strengths, key improvements, and "
+    "priority coaching actions.",
+)

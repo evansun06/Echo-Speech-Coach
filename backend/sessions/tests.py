@@ -1,7 +1,11 @@
+import importlib.util
+import sys
 import tempfile
+import types
+import unittest
 from io import StringIO
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -14,6 +18,42 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
 
+from llm.coach_graph import build_reasoning_graph, run_reasoning_graph
+from llm.enqueue import (
+    enqueue_full_coach_workflow_job,
+    enqueue_flagship_final_reconciliation_job,
+    enqueue_subagent_finalize_job,
+    enqueue_subagent_window_job,
+    enqueue_subagent_window_jobs,
+)
+from llm.flagship_final_workflow import (
+    FlagshipFinalWorkflowError,
+    run_flagship_final_reconciliation,
+)
+from llm.ledger import (
+    LedgerValidationError,
+    RunStateError,
+    append_ledger_entry,
+    create_agent_execution,
+    create_orchestration_run,
+    mark_agent_completed,
+    mark_agent_failed,
+    mark_agent_processing,
+    mark_run_completed,
+    mark_run_failed,
+    mark_run_processing,
+    read_ledger_slice,
+    touch_agent_heartbeat,
+)
+from llm.provider import ModelConfigurationError, ReasoningModels, build_reasoning_models
+from llm.schemas import ReasoningInput, ReasoningResult
+from llm.subagent_workflow import (
+    SUBAGENT_SYSTEM_PROMPT,
+    SubagentInputValidationError,
+    finalize_subagent_run,
+    run_subagent_execution,
+)
+from llm.tasks import run_flagship_final_reconcile_task
 from ml.enqueue import enqueue_random_sleep_demo_job, enqueue_random_sleep_demo_jobs
 from sessions.models import (
     CoachAgentExecution,
@@ -28,6 +68,11 @@ from sessions.models import (
     CoachingSession,
     MaxFileSizeValidator,
     SessionStatus,
+)
+
+HAS_LANGGRAPH_STACK = (
+    importlib.util.find_spec("langgraph") is not None
+    and importlib.util.find_spec("langchain_core") is not None
 )
 
 
@@ -64,6 +109,325 @@ class DemoEnqueueWrapperTests(SimpleTestCase):
 
         self.assertEqual(task_ids, ["task-1", "task-2", "task-3"])
         self.assertEqual(enqueue_mock.call_count, 3)
+
+
+class SubagentEnqueueWrapperTests(SimpleTestCase):
+    @patch("llm.enqueue.run_subagent_window_task.apply_async")
+    @patch("llm.enqueue.create_subagent_execution_for_window")
+    @patch("llm.enqueue.mark_run_processing")
+    def test_enqueue_subagent_window_job_creates_execution_and_dispatches_task(
+        self,
+        mark_run_processing_mock,
+        create_execution_mock,
+        apply_async_mock,
+    ):
+        queued_run = SimpleNamespace(status=CoachOrchestrationRunStatus.QUEUED, id="run-1")
+        processing_run = SimpleNamespace(
+            status=CoachOrchestrationRunStatus.PROCESSING,
+            id="run-1",
+        )
+        mark_run_processing_mock.return_value = processing_run
+        create_execution_mock.return_value = SimpleNamespace(id="exec-1")
+        apply_async_mock.return_value = SimpleNamespace(id="task-1")
+
+        async_result, execution_id = enqueue_subagent_window_job(
+            run=queued_run,
+            session_id="session-1",
+            window_start_ms=0,
+            window_end_ms=30_000,
+            events=[{"event_id": "e-1"}],
+            word_map=[{"word": "hello", "start_ms": 10, "end_ms": 50}],
+            metadata={"source": "test"},
+        )
+
+        mark_run_processing_mock.assert_called_once_with(run=queued_run)
+        create_execution_mock.assert_called_once_with(
+            run=processing_run,
+            window_start_ms=0,
+            window_end_ms=30_000,
+        )
+        apply_async_mock.assert_called_once()
+        self.assertEqual(async_result.id, "task-1")
+        self.assertEqual(execution_id, "exec-1")
+
+    @patch("llm.enqueue.enqueue_subagent_window_job")
+    def test_enqueue_subagent_window_jobs_sorts_windows_by_time(
+        self,
+        enqueue_single_mock,
+    ):
+        enqueue_single_mock.side_effect = [
+            (SimpleNamespace(id="task-1"), "exec-1"),
+            (SimpleNamespace(id="task-2"), "exec-2"),
+        ]
+        run = SimpleNamespace(status=CoachOrchestrationRunStatus.PROCESSING, id="run-1")
+        windows = [
+            {
+                "window_start_ms": 30_000,
+                "window_end_ms": 60_000,
+                "events": [{"event_id": "e-2"}],
+                "word_map": [{"word": "later", "start_ms": 31_000, "end_ms": 31_100}],
+            },
+            {
+                "window_start_ms": 0,
+                "window_end_ms": 30_000,
+                "events": [{"event_id": "e-1"}],
+                "word_map": [{"word": "first", "start_ms": 100, "end_ms": 200}],
+            },
+        ]
+
+        jobs = enqueue_subagent_window_jobs(
+            run=run,
+            session_id="session-1",
+            windows=windows,
+        )
+
+        self.assertEqual(len(jobs), 2)
+        self.assertEqual(jobs[0]["task_id"], "task-1")
+        self.assertEqual(jobs[0]["execution_id"], "exec-1")
+        self.assertEqual(jobs[1]["task_id"], "task-2")
+        self.assertEqual(jobs[1]["execution_id"], "exec-2")
+        first_call_kwargs = enqueue_single_mock.call_args_list[0].kwargs
+        second_call_kwargs = enqueue_single_mock.call_args_list[1].kwargs
+        self.assertEqual(first_call_kwargs["window_start_ms"], 0)
+        self.assertEqual(second_call_kwargs["window_start_ms"], 30_000)
+
+    @patch("llm.enqueue.finalize_subagent_run_task.apply_async")
+    def test_enqueue_subagent_finalize_job_dispatches_expected_kwargs(
+        self,
+        apply_async_mock,
+    ):
+        apply_async_mock.return_value = SimpleNamespace(id="finalize-task-1")
+
+        async_result = enqueue_subagent_finalize_job(run_id="run-1")
+
+        apply_async_mock.assert_called_once_with(kwargs={"run_id": "run-1"})
+        self.assertEqual(async_result.id, "finalize-task-1")
+
+
+class FlagshipFinalEnqueueWrapperTests(SimpleTestCase):
+    @patch("llm.enqueue.run_flagship_final_reconcile_task.apply_async")
+    def test_enqueue_flagship_final_reconciliation_job_dispatches_minimum_kwargs(
+        self,
+        apply_async_mock,
+    ):
+        apply_async_mock.return_value = SimpleNamespace(id="flagship-final-task-1")
+
+        async_result = enqueue_flagship_final_reconciliation_job(run_id="run-1")
+
+        apply_async_mock.assert_called_once_with(kwargs={"run_id": "run-1"})
+        self.assertEqual(async_result.id, "flagship-final-task-1")
+
+    @patch("llm.enqueue.run_flagship_final_reconcile_task.apply_async")
+    def test_enqueue_flagship_final_reconciliation_job_includes_prompt_when_provided(
+        self,
+        apply_async_mock,
+    ):
+        apply_async_mock.return_value = SimpleNamespace(id="flagship-final-task-2")
+
+        async_result = enqueue_flagship_final_reconciliation_job(
+            run_id="run-1",
+            system_prompt="custom final prompt",
+        )
+
+        apply_async_mock.assert_called_once_with(
+            kwargs={"run_id": "run-1", "system_prompt": "custom final prompt"}
+        )
+        self.assertEqual(async_result.id, "flagship-final-task-2")
+
+
+class FullWorkflowEnqueueWrapperTests(SimpleTestCase):
+    @patch("llm.enqueue.chord")
+    @patch("llm.enqueue.chain")
+    @patch("llm.enqueue.run_flagship_final_reconcile_task.si")
+    @patch("llm.enqueue.finalize_subagent_run_task.si")
+    @patch("llm.enqueue.run_subagent_window_task.si")
+    @patch("llm.enqueue.create_subagent_execution_for_window")
+    @patch("llm.enqueue.create_orchestration_run")
+    @patch("llm.enqueue.CoachingSession.objects.get")
+    def test_enqueue_full_coach_workflow_job_dispatches_subagents_then_finalize_chain(
+        self,
+        session_get_mock,
+        create_run_mock,
+        create_execution_mock,
+        subagent_signature_mock,
+        finalize_signature_mock,
+        flagship_signature_mock,
+        chain_mock,
+        chord_mock,
+    ):
+        session = SimpleNamespace(
+            id="session-1",
+            status=SessionStatus.ML_READY,
+            save=MagicMock(),
+        )
+        run = SimpleNamespace(id="run-1")
+        session_get_mock.return_value = session
+        create_run_mock.return_value = run
+        create_execution_mock.side_effect = [
+            SimpleNamespace(id="exec-1"),
+            SimpleNamespace(id="exec-2"),
+        ]
+        subagent_signature_mock.side_effect = [
+            SimpleNamespace(name="subagent-1"),
+            SimpleNamespace(name="subagent-2"),
+        ]
+        finalize_signature = SimpleNamespace(name="finalize")
+        flagship_signature = SimpleNamespace(name="flagship-final")
+        finalize_signature_mock.return_value = finalize_signature
+        flagship_signature_mock.return_value = flagship_signature
+        completion_chain = SimpleNamespace(name="completion-chain")
+        chain_mock.return_value = completion_chain
+        workflow_async_result = SimpleNamespace(id="workflow-task-1")
+        chord_invoker = MagicMock(return_value=workflow_async_result)
+        chord_mock.return_value = chord_invoker
+
+        result = enqueue_full_coach_workflow_job(
+            session_id="session-1",
+            windows=[
+                {
+                    "window_start_ms": 30_000,
+                    "window_end_ms": 60_000,
+                    "events": [{"event_id": "b"}],
+                    "word_map": [{"word": "b"}],
+                    "metadata": {"window": "b"},
+                },
+                {
+                    "window_start_ms": 0,
+                    "window_end_ms": 30_000,
+                    "events": [{"event_id": "a"}],
+                    "word_map": [{"word": "a"}],
+                    "metadata": {"window": "a"},
+                },
+            ],
+            subagent_metadata={"shared": "yes"},
+            flagship_final_system_prompt="flagship prompt",
+        )
+
+        self.assertEqual(session.status, SessionStatus.PROCESSING_COACH)
+        session.save.assert_called_once_with(update_fields=["status", "updated_at"])
+        create_run_mock.assert_called_once_with(session=session)
+        self.assertEqual(create_execution_mock.call_count, 2)
+        first_create_kwargs = create_execution_mock.call_args_list[0].kwargs
+        second_create_kwargs = create_execution_mock.call_args_list[1].kwargs
+        self.assertEqual(first_create_kwargs["window_start_ms"], 0)
+        self.assertEqual(second_create_kwargs["window_start_ms"], 30_000)
+        finalize_signature_mock.assert_called_once_with(run_id="run-1")
+        flagship_signature_mock.assert_called_once_with(
+            run_id="run-1",
+            system_prompt="flagship prompt",
+        )
+        chain_mock.assert_called_once_with(finalize_signature, flagship_signature)
+        chord_invoker.assert_called_once_with(completion_chain)
+        self.assertEqual(result["run_id"], "run-1")
+        self.assertEqual(result["workflow_task_id"], "workflow-task-1")
+        self.assertEqual(result["subagent_task_count"], 2)
+        self.assertEqual(result["subagent_execution_ids"], ["exec-1", "exec-2"])
+
+    @patch("llm.enqueue.chord")
+    @patch("llm.enqueue.chain")
+    @patch("llm.enqueue.run_flagship_final_reconcile_task.si")
+    @patch("llm.enqueue.finalize_subagent_run_task.si")
+    @patch("llm.enqueue.run_subagent_window_task.si")
+    @patch("llm.enqueue.create_subagent_execution_for_window")
+    @patch("llm.enqueue.create_orchestration_run")
+    @patch("llm.enqueue.CoachingSession.objects.get")
+    def test_enqueue_full_coach_workflow_job_without_windows_dispatches_chain_only(
+        self,
+        session_get_mock,
+        create_run_mock,
+        create_execution_mock,
+        subagent_signature_mock,
+        finalize_signature_mock,
+        flagship_signature_mock,
+        chain_mock,
+        chord_mock,
+    ):
+        session = SimpleNamespace(
+            id="session-1",
+            status=SessionStatus.PROCESSING_COACH,
+            save=MagicMock(),
+        )
+        run = SimpleNamespace(id="run-1")
+        session_get_mock.return_value = session
+        create_run_mock.return_value = run
+        finalize_signature = SimpleNamespace(name="finalize")
+        flagship_signature = SimpleNamespace(name="flagship-final")
+        finalize_signature_mock.return_value = finalize_signature
+        flagship_signature_mock.return_value = flagship_signature
+        workflow_async_result = SimpleNamespace(id="workflow-task-2")
+        completion_chain = SimpleNamespace(
+            name="completion-chain",
+            apply_async=MagicMock(return_value=workflow_async_result),
+        )
+        chain_mock.return_value = completion_chain
+
+        result = enqueue_full_coach_workflow_job(
+            session_id="session-1",
+            windows=[],
+        )
+
+        session.save.assert_not_called()
+        create_execution_mock.assert_not_called()
+        subagent_signature_mock.assert_not_called()
+        flagship_signature_mock.assert_called_once_with(run_id="run-1")
+        completion_chain.apply_async.assert_called_once_with()
+        chord_mock.assert_not_called()
+        self.assertEqual(result["workflow_task_id"], "workflow-task-2")
+        self.assertEqual(result["subagent_task_count"], 0)
+
+
+class FlagshipFinalTaskTests(SimpleTestCase):
+    @patch("llm.tasks.run_flagship_final_reconciliation")
+    def test_run_flagship_final_reconcile_task_delegates_to_workflow(
+        self,
+        workflow_mock,
+    ):
+        workflow_mock.return_value = {"status": "completed", "run_id": "run-1"}
+
+        result = run_flagship_final_reconcile_task(
+            run_id="run-1",
+            system_prompt="system prompt",
+        )
+
+        workflow_mock.assert_called_once_with(
+            run_id="run-1",
+            system_prompt="system prompt",
+        )
+        self.assertEqual(result["status"], "completed")
+
+
+class FlagshipFinalWorkflowEntryTests(SimpleTestCase):
+    def test_run_flagship_final_reconciliation_uses_settings_prompt_by_default(self):
+        class FakeGraph:
+            def __init__(self):
+                self.calls = []
+
+            def invoke(self, state):
+                self.calls.append(state)
+                return {
+                    "used_live_ledger": True,
+                    "final_agent_execution_id": "exec-1",
+                    "output_seq_to": 7,
+                    "finalized_result": {"status": "completed"},
+                }
+
+        fake_graph = FakeGraph()
+        with override_settings(GEMINI_FLAGSHIP_FINAL_SYSTEM_PROMPT="settings final prompt"):
+            result = run_flagship_final_reconciliation(run_id="run-1", graph=fake_graph)
+
+        self.assertEqual(len(fake_graph.calls), 1)
+        self.assertEqual(fake_graph.calls[0]["system_prompt"], "settings final prompt")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["final_agent_execution_id"], "exec-1")
+        self.assertEqual(result["output_seq_to"], 7)
+
+    def test_run_flagship_final_reconciliation_rejects_missing_prompt(self):
+        with override_settings(GEMINI_FLAGSHIP_FINAL_SYSTEM_PROMPT="  "):
+            with self.assertRaises(FlagshipFinalWorkflowError):
+                run_flagship_final_reconciliation(
+                    run_id="run-1",
+                    graph=SimpleNamespace(invoke=lambda state: state),
+                )
 
 
 class EnqueueDemoJobsCommandTests(SimpleTestCase):
@@ -107,6 +471,105 @@ class EnqueueDemoJobsCommandTests(SimpleTestCase):
                 "--max-seconds",
                 "1",
             )
+
+
+class GeminiReasoningProviderTests(SimpleTestCase):
+    def test_build_reasoning_models_requires_api_key(self):
+        with self.assertRaises(ModelConfigurationError):
+            build_reasoning_models(api_key="")
+
+    def test_build_reasoning_models_uses_configured_model_ids(self):
+        captured_configs: list[dict[str, object]] = []
+
+        class FakeChatGoogleGenerativeAI:
+            def __init__(self, **kwargs):
+                captured_configs.append(kwargs)
+                self.model = kwargs.get("model")
+
+        fake_module = types.ModuleType("langchain_google_genai")
+        fake_module.ChatGoogleGenerativeAI = FakeChatGoogleGenerativeAI
+
+        with patch.dict(sys.modules, {"langchain_google_genai": fake_module}):
+            with override_settings(
+                GEMINI_API_KEY="test-api-key",
+                GEMINI_SUBAGENT_MODEL="gemini-2.0-flash",
+                GEMINI_PRIMARY_MODEL="gemini-3.0-pro",
+                GEMINI_SUBAGENT_TEMPERATURE=0.2,
+                GEMINI_PRIMARY_TEMPERATURE=0.1,
+            ):
+                models = build_reasoning_models()
+
+        self.assertEqual(models.subagent_model_name, "gemini-2.0-flash")
+        self.assertEqual(models.primary_model_name, "gemini-3.0-pro")
+        self.assertEqual(len(captured_configs), 2)
+        self.assertEqual(captured_configs[0]["model"], "gemini-2.0-flash")
+        self.assertEqual(captured_configs[1]["model"], "gemini-3.0-pro")
+        self.assertEqual(captured_configs[0]["google_api_key"], "test-api-key")
+        self.assertEqual(captured_configs[1]["google_api_key"], "test-api-key")
+        self.assertEqual(captured_configs[0]["temperature"], 0.2)
+        self.assertEqual(captured_configs[1]["temperature"], 0.1)
+
+
+@unittest.skipUnless(
+    HAS_LANGGRAPH_STACK,
+    "langgraph/langchain-core dependencies are not installed",
+)
+class LangGraphReasoningTests(SimpleTestCase):
+    def test_graph_routes_subagent_and_primary_to_expected_models(self):
+        class FakeModel:
+            def __init__(self, response_text: str):
+                self.response_text = response_text
+                self.calls = []
+
+            def invoke(self, messages):
+                self.calls.append(messages)
+                return SimpleNamespace(
+                    content=self.response_text,
+                    usage_metadata={
+                        "input_tokens": 11,
+                        "output_tokens": 7,
+                        "total_tokens": 18,
+                    },
+                    response_metadata={"finish_reason": "stop"},
+                )
+
+        subagent = FakeModel("subagent note")
+        primary = FakeModel("primary impression")
+        models = ReasoningModels(
+            subagent=subagent,
+            primary=primary,
+            subagent_model_name="gemini-2.0-flash",
+            primary_model_name="gemini-3.0-pro",
+        )
+        graph = build_reasoning_graph(models=models)
+
+        subagent_result = run_reasoning_graph(
+            graph=graph,
+            reasoning_input=ReasoningInput(
+                role="subagent",
+                system_prompt="system",
+                user_prompt="window events",
+                metadata={"window_start_ms": 0},
+            ),
+        )
+        primary_result = run_reasoning_graph(
+            graph=graph,
+            reasoning_input=ReasoningInput(
+                role="primary",
+                system_prompt="system",
+                user_prompt="ledger updates",
+                metadata={"input_seq_from": 1},
+            ),
+        )
+
+        self.assertEqual(len(subagent.calls), 1)
+        self.assertEqual(len(primary.calls), 1)
+        self.assertEqual(subagent_result.output_text, "subagent note")
+        self.assertEqual(primary_result.output_text, "primary impression")
+        self.assertEqual(subagent_result.model_name, "gemini-2.0-flash")
+        self.assertEqual(primary_result.model_name, "gemini-3.0-pro")
+        self.assertEqual(subagent_result.usage["total_tokens"], 18)
+        self.assertEqual(primary_result.response_metadata["finish_reason"], "stop")
 
 
 class CoachingSessionModelTests(TestCase):
@@ -315,6 +778,379 @@ class CoachOrchestrationModelsTests(TestCase):
                 agent_name="flagship",
                 content="Duplicate sequence",
             )
+
+
+class CoachLedgerServiceTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            username="ledger-service@example.com",
+            email="ledger-service@example.com",
+            password="password123",
+        )
+        self.session = CoachingSession.objects.create(
+            user=self.user,
+            status=SessionStatus.PROCESSING_COACH,
+            video_file="sessions/videos/2026/03/08/demo.mp4",
+        )
+
+    def test_create_orchestration_run_increments_run_index(self):
+        CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.COMPLETED,
+        )
+
+        run = create_orchestration_run(session=self.session)
+
+        self.assertEqual(run.run_index, 2)
+        self.assertEqual(run.status, CoachOrchestrationRunStatus.QUEUED)
+
+    def test_create_orchestration_run_rejects_session_with_active_run(self):
+        CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.QUEUED,
+        )
+
+        with self.assertRaises(RunStateError):
+            create_orchestration_run(session=self.session)
+
+    def test_create_agent_execution_increments_execution_index(self):
+        run = CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.PROCESSING,
+        )
+
+        first = create_agent_execution(
+            run=run,
+            agent_kind=CoachAgentKind.SUBAGENT,
+            agent_name="subagent-window-1",
+            window_start_ms=0,
+            window_end_ms=30_000,
+        )
+        second = create_agent_execution(
+            run=run,
+            agent_kind=CoachAgentKind.FLAGSHIP_PERIODIC,
+            agent_name="flagship-pass-1",
+        )
+
+        self.assertEqual(first.execution_index, 1)
+        self.assertEqual(second.execution_index, 2)
+
+    def test_append_ledger_entry_allocates_sequence_and_updates_run(self):
+        run = CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.PROCESSING,
+        )
+        execution = create_agent_execution(
+            run=run,
+            agent_kind=CoachAgentKind.SUBAGENT,
+            agent_name="subagent-window-1",
+            window_start_ms=0,
+            window_end_ms=30_000,
+        )
+
+        first = append_ledger_entry(
+            run=run,
+            entry_kind=LedgerEntryKind.SUBAGENT_NOTE,
+            content="Local pacing improved in this window.",
+            agent_execution=execution,
+            payload={"title": "Pacing"},
+        )
+        second = append_ledger_entry(
+            run=run,
+            entry_kind=LedgerEntryKind.FLAGSHIP_IMPRESSION,
+            content="Overall pacing trend is stable.",
+            agent_kind=CoachAgentKind.FLAGSHIP_PERIODIC,
+            agent_name="flagship-pass-1",
+        )
+
+        run.refresh_from_db()
+        self.assertEqual(first.sequence, 1)
+        self.assertEqual(second.sequence, 2)
+        self.assertEqual(run.latest_ledger_sequence, 2)
+        self.assertEqual(first.agent_name, "subagent-window-1")
+        self.assertEqual(second.agent_name, "flagship-pass-1")
+
+    def test_append_ledger_entry_validates_execution_belongs_to_run(self):
+        run = CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.PROCESSING,
+        )
+        second_run = CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=2,
+            status=CoachOrchestrationRunStatus.FAILED,
+        )
+        execution = create_agent_execution(
+            run=run,
+            agent_kind=CoachAgentKind.SUBAGENT,
+            agent_name="subagent-window-1",
+        )
+
+        with self.assertRaises(LedgerValidationError):
+            append_ledger_entry(
+                run=second_run,
+                entry_kind=LedgerEntryKind.SUBAGENT_NOTE,
+                content="Invalid linkage",
+                agent_execution=execution,
+            )
+
+    def test_read_ledger_slice_filters_by_sequence_and_kind(self):
+        run = CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.PROCESSING,
+        )
+        append_ledger_entry(
+            run=run,
+            entry_kind=LedgerEntryKind.SUBAGENT_NOTE,
+            content="Entry 1",
+            agent_kind=CoachAgentKind.SUBAGENT,
+            agent_name="subagent-1",
+        )
+        append_ledger_entry(
+            run=run,
+            entry_kind=LedgerEntryKind.FLAGSHIP_IMPRESSION,
+            content="Entry 2",
+            agent_kind=CoachAgentKind.FLAGSHIP_PERIODIC,
+            agent_name="flagship",
+        )
+        append_ledger_entry(
+            run=run,
+            entry_kind=LedgerEntryKind.SUBAGENT_NOTE,
+            content="Entry 3",
+            agent_kind=CoachAgentKind.SUBAGENT,
+            agent_name="subagent-2",
+        )
+
+        entries = read_ledger_slice(
+            run=run,
+            sequence_gt=1,
+            sequence_lte=3,
+            entry_kind=LedgerEntryKind.SUBAGENT_NOTE,
+        )
+        self.assertEqual([entry.sequence for entry in entries], [3])
+
+    def test_run_and_agent_lifecycle_helpers_update_status_and_timestamps(self):
+        run = create_orchestration_run(session=self.session)
+        run = mark_run_processing(run=run)
+        self.assertEqual(run.status, CoachOrchestrationRunStatus.PROCESSING)
+        self.assertIsNotNone(run.started_at)
+
+        execution = create_agent_execution(
+            run=run,
+            agent_kind=CoachAgentKind.SUBAGENT,
+            agent_name="subagent-window-1",
+        )
+        execution = mark_agent_processing(execution=execution)
+        execution = touch_agent_heartbeat(execution=execution)
+        execution = mark_agent_completed(execution=execution, output_seq_to=4)
+        self.assertEqual(execution.status, CoachAgentExecutionStatus.COMPLETED)
+        self.assertIsNotNone(execution.last_heartbeat_at)
+        self.assertEqual(execution.output_seq_to, 4)
+
+        run = mark_run_completed(run=run)
+        self.assertEqual(run.status, CoachOrchestrationRunStatus.COMPLETED)
+        self.assertIsNotNone(run.completed_at)
+
+    def test_failed_lifecycle_helpers_capture_error_message(self):
+        run = create_orchestration_run(session=self.session)
+        run = mark_run_failed(run=run, error_message="failure on run")
+        self.assertEqual(run.status, CoachOrchestrationRunStatus.FAILED)
+        self.assertEqual(run.error_message, "failure on run")
+
+        execution = create_agent_execution(
+            run=run,
+            agent_kind=CoachAgentKind.FLAGSHIP_FINAL,
+            agent_name="flagship-final",
+        )
+        execution = mark_agent_failed(
+            execution=execution,
+            error_message="failure on final pass",
+        )
+        self.assertEqual(execution.status, CoachAgentExecutionStatus.FAILED)
+        self.assertEqual(execution.error_message, "failure on final pass")
+
+
+class SubagentWorkflowServiceTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            username="subagent-workflow@example.com",
+            email="subagent-workflow@example.com",
+            password="password123",
+        )
+        self.session = CoachingSession.objects.create(
+            user=self.user,
+            status=SessionStatus.PROCESSING_COACH,
+            video_file="sessions/videos/2026/03/08/demo.mp4",
+        )
+        self.run = CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.QUEUED,
+        )
+        self.execution = create_agent_execution(
+            run=self.run,
+            agent_kind=CoachAgentKind.SUBAGENT,
+            agent_name="subagent-window-0-30000",
+            window_start_ms=0,
+            window_end_ms=30_000,
+        )
+
+    @patch("llm.subagent_workflow.get_live_ledger_latest_sequence")
+    @patch("llm.subagent_workflow.append_live_ledger_entry")
+    @patch("llm.subagent_workflow.run_subagent_structured_reasoning")
+    def test_run_subagent_execution_appends_notes_and_marks_execution_completed(
+        self,
+        run_reasoning_mock,
+        append_live_mock,
+        get_latest_mock,
+    ):
+        get_latest_mock.return_value = 0
+        run_reasoning_mock.return_value = ReasoningResult(
+            role="subagent",
+            model_name="gemini-2.0-flash",
+            output_text="",
+            usage={"total_tokens": 42},
+            response_metadata={},
+            request_metadata={},
+            structured_output={
+                "notes": [
+                    {"event_id": "event-1", "note": "Filler cluster appears mid-window."},
+                    {"event_id": "event-2", "note": "Pacing improves near the end."},
+                ],
+                "impression": "Momentum improves through the window. Keep cadence steady.",
+            },
+        )
+        append_live_mock.side_effect = [
+            {"sequence": 1},
+            {"sequence": 2},
+            {"sequence": 3},
+        ]
+
+        result = run_subagent_execution(
+            execution_id=str(self.execution.id),
+            session_id=str(self.session.id),
+            events=[
+                {
+                    "event_id": "event-1",
+                    "event_type": "filler",
+                    "start_ms": 2_000,
+                    "end_ms": 5_000,
+                    "metadata": {"count": 4},
+                },
+                {
+                    "event_id": "event-2",
+                    "event_type": "pace",
+                    "start_ms": 10_000,
+                    "end_ms": 16_000,
+                    "metadata": {"delta": -0.2},
+                },
+            ],
+            word_map=[
+                {"word": "hello", "start_ms": 100, "end_ms": 200},
+                {"word": "there", "start_ms": 250, "end_ms": 350},
+            ],
+        )
+
+        self.execution.refresh_from_db()
+        self.run.refresh_from_db()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["notes_count"], 2)
+        self.assertEqual(result["impression"], "Momentum improves through the window.")
+        self.assertEqual(self.execution.status, CoachAgentExecutionStatus.COMPLETED)
+        self.assertEqual(self.execution.output_seq_to, 3)
+        self.assertEqual(self.run.status, CoachOrchestrationRunStatus.PROCESSING)
+        self.assertEqual(append_live_mock.call_count, 3)
+        self.assertEqual(
+            run_reasoning_mock.call_args.kwargs["system_prompt"],
+            SUBAGENT_SYSTEM_PROMPT,
+        )
+
+    @patch("llm.subagent_workflow.run_subagent_structured_reasoning")
+    def test_run_subagent_execution_validates_event_shape_before_model_call(
+        self,
+        run_reasoning_mock,
+    ):
+        with self.assertRaises(SubagentInputValidationError):
+            run_subagent_execution(
+                execution_id=str(self.execution.id),
+                session_id=str(self.session.id),
+                events=[
+                    {
+                        "event_id": "event-1",
+                        "start_ms": 0,
+                        "end_ms": 500,
+                        "metadata": {},
+                    }
+                ],
+                word_map=[{"word": "hello", "start_ms": 0, "end_ms": 100}],
+            )
+
+        self.execution.refresh_from_db()
+        self.run.refresh_from_db()
+        self.assertEqual(self.execution.status, CoachAgentExecutionStatus.FAILED)
+        self.assertEqual(self.run.status, CoachOrchestrationRunStatus.PROCESSING)
+        run_reasoning_mock.assert_not_called()
+
+    @patch("llm.subagent_workflow.clear_live_ledger")
+    @patch("llm.subagent_workflow.read_live_ledger_slice")
+    def test_finalize_subagent_run_flushes_redis_entries_to_db(
+        self,
+        read_live_slice_mock,
+        clear_live_ledger_mock,
+    ):
+        self.run.status = CoachOrchestrationRunStatus.PROCESSING
+        self.run.save(update_fields=["status", "updated_at"])
+        mark_agent_processing(execution=self.execution)
+        mark_agent_completed(execution=self.execution)
+
+        read_live_slice_mock.return_value = [
+            {
+                "sequence": 1,
+                "run_id": str(self.run.id),
+                "entry_kind": LedgerEntryKind.SUBAGENT_NOTE,
+                "content": "Event note body",
+                "payload": {"title": "filler (event-1)", "event_id": "event-1"},
+                "agent_execution_id": str(self.execution.id),
+                "agent_kind": CoachAgentKind.SUBAGENT,
+                "agent_name": self.execution.agent_name,
+                "window_start_ms": self.execution.window_start_ms,
+                "window_end_ms": self.execution.window_end_ms,
+                "created_at": timezone.now().isoformat(),
+            },
+            {
+                "sequence": 2,
+                "run_id": str(self.run.id),
+                "entry_kind": LedgerEntryKind.SUBAGENT_NOTE,
+                "content": "Window impression body",
+                "payload": {"title": "Window impression"},
+                "agent_execution_id": str(self.execution.id),
+                "agent_kind": CoachAgentKind.SUBAGENT,
+                "agent_name": self.execution.agent_name,
+                "window_start_ms": self.execution.window_start_ms,
+                "window_end_ms": self.execution.window_end_ms,
+                "created_at": timezone.now().isoformat(),
+            },
+        ]
+
+        result = finalize_subagent_run(run_id=str(self.run.id))
+
+        self.run.refresh_from_db()
+        entries = list(self.run.ledger_entries.order_by("sequence"))
+        self.assertEqual(result["flushed_entries"], 2)
+        self.assertEqual(self.run.status, CoachOrchestrationRunStatus.COMPLETED)
+        self.assertEqual(self.run.latest_ledger_sequence, 2)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0].content, "Event note body")
+        self.assertEqual(entries[1].content, "Window impression body")
+        clear_live_ledger_mock.assert_called_once_with(run_id=str(self.run.id))
 
 
 class CoachingSessionApiTests(TestCase):
@@ -572,6 +1408,70 @@ class CoachingSessionApiTests(TestCase):
         self.assertEqual(
             coach_progress["stages"][1]["notes"][0]["evidence_refs"],
             ["01:00-01:40"],
+        )
+
+    @patch("sessions.serializers.get_live_ledger_latest_sequence")
+    @patch("sessions.serializers.read_live_ledger_slice")
+    def test_get_session_prefers_live_ledger_entries_for_active_run(
+        self,
+        read_live_slice_mock,
+        get_live_latest_mock,
+    ):
+        session = CoachingSession.objects.create(
+            user=self.user,
+            title="Live Ledger Session",
+            status=SessionStatus.PROCESSING_COACH,
+            video_file="sessions/videos/2026/03/08/demo.mp4",
+        )
+        run = CoachOrchestrationRun.objects.create(
+            session=session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.PROCESSING,
+            latest_ledger_sequence=0,
+            started_at=timezone.now(),
+        )
+        execution = CoachAgentExecution.objects.create(
+            run=run,
+            execution_index=1,
+            agent_kind=CoachAgentKind.SUBAGENT,
+            agent_name="subagent-window-0-30000",
+            status=CoachAgentExecutionStatus.COMPLETED,
+            window_start_ms=0,
+            window_end_ms=30_000,
+            started_at=timezone.now(),
+            finished_at=timezone.now(),
+        )
+        read_live_slice_mock.return_value = [
+            {
+                "sequence": 4,
+                "run_id": str(run.id),
+                "entry_kind": LedgerEntryKind.SUBAGENT_NOTE,
+                "content": "Pacing improved in the second half.",
+                "payload": {
+                    "title": "Window impression",
+                    "evidence_refs": ["00:10-00:25"],
+                },
+                "agent_execution_id": str(execution.id),
+                "agent_kind": CoachAgentKind.SUBAGENT,
+                "agent_name": execution.agent_name,
+                "window_start_ms": 0,
+                "window_end_ms": 30_000,
+                "created_at": timezone.now().isoformat(),
+            }
+        ]
+        get_live_latest_mock.return_value = 4
+
+        detail_url = reverse("api:session-detail", kwargs={"id": session.id})
+        response = self.client.get(detail_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        coach_progress = response.data["coach_progress"]
+        self.assertEqual(coach_progress["latest_ledger_sequence"], 4)
+        self.assertEqual(len(coach_progress["stages"]), 1)
+        self.assertEqual(coach_progress["stages"][0]["notes"][0]["title"], "Window impression")
+        self.assertEqual(
+            coach_progress["stages"][0]["notes"][0]["evidence_refs"],
+            ["00:10-00:25"],
         )
 
     def test_upload_video_moves_session_to_media_attached(self):

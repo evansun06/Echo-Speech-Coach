@@ -5,6 +5,8 @@ from typing import Any
 
 from rest_framework import serializers
 
+from llm.live_ledger import get_live_ledger_latest_sequence, read_live_ledger_slice
+
 from .models import (
     CoachAgentExecutionStatus,
     CoachOrchestrationRun,
@@ -91,6 +93,37 @@ def _select_progress_run(session: CoachingSession) -> CoachOrchestrationRun | No
     if active_run is not None:
         return active_run
     return session.coach_runs.order_by("-run_index", "-created_at").first()
+
+
+def _can_use_live_ledger(run: CoachOrchestrationRun) -> bool:
+    """Return whether this run can expose live Redis-backed ledger updates."""
+    return run.status in {
+        CoachOrchestrationRunStatus.QUEUED,
+        CoachOrchestrationRunStatus.PROCESSING,
+    }
+
+
+def _read_live_ledger_entries(
+    run: CoachOrchestrationRun,
+) -> tuple[list[dict[str, Any]], int]:
+    """Read live-ledger entries safely, returning empty results on transient errors."""
+    if not _can_use_live_ledger(run):
+        return [], 0
+    try:
+        entries = read_live_ledger_slice(run_id=str(run.id), sequence_gt=0)
+        latest_sequence = get_live_ledger_latest_sequence(run_id=str(run.id))
+    except Exception:
+        return [], 0
+    if entries:
+        latest_sequence = max(
+            latest_sequence,
+            max(
+                int(item.get("sequence", 0))
+                for item in entries
+                if isinstance(item, dict)
+            ),
+        )
+    return entries, latest_sequence
 
 
 class CreateSessionSerializer(serializers.Serializer):
@@ -199,22 +232,58 @@ class SessionDetailSerializer(serializers.ModelSerializer):
             run.agent_executions.order_by("execution_index", "created_at")
         )
         ledger_entries = list(run.ledger_entries.order_by("sequence", "created_at"))
+        live_entries, live_latest_sequence = _read_live_ledger_entries(run)
+        use_live_entries = bool(live_entries)
+        if use_live_entries:
+            executions = sorted(
+                executions,
+                key=lambda item: (
+                    item.window_start_ms is None,
+                    item.window_start_ms or 0,
+                    item.execution_index,
+                    item.created_at,
+                ),
+            )
 
         notes_by_execution_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for entry in ledger_entries:
-            payload = entry.payload if isinstance(entry.payload, dict) else {}
-            title = payload.get("title")
-            note_title = title if isinstance(title, str) and title else entry.get_entry_kind_display()
-            note_payload = {
-                "note_id": str(entry.id),
-                "title": note_title,
-                "body": entry.content,
-                "evidence_refs": _extract_evidence_refs(payload),
-                "default_collapsed": True,
-            }
-            if entry.agent_execution_id is None:
-                continue
-            notes_by_execution_id[str(entry.agent_execution_id)].append(note_payload)
+        if use_live_entries:
+            for entry in live_entries:
+                payload = entry.get("payload")
+                normalized_payload = payload if isinstance(payload, dict) else {}
+                title = normalized_payload.get("title")
+                note_title = (
+                    title
+                    if isinstance(title, str) and title
+                    else str(entry.get("entry_kind", "Note"))
+                )
+                note_payload = {
+                    "note_id": f"live-{entry.get('sequence', '')}",
+                    "title": note_title,
+                    "body": str(entry.get("content", "")),
+                    "evidence_refs": _extract_evidence_refs(normalized_payload),
+                    "default_collapsed": True,
+                }
+                execution_id = entry.get("agent_execution_id")
+                if not isinstance(execution_id, str) or not execution_id:
+                    continue
+                notes_by_execution_id[execution_id].append(note_payload)
+        else:
+            for entry in ledger_entries:
+                payload = entry.payload if isinstance(entry.payload, dict) else {}
+                title = payload.get("title")
+                note_title = (
+                    title if isinstance(title, str) and title else entry.get_entry_kind_display()
+                )
+                note_payload = {
+                    "note_id": str(entry.id),
+                    "title": note_title,
+                    "body": entry.content,
+                    "evidence_refs": _extract_evidence_refs(payload),
+                    "default_collapsed": True,
+                }
+                if entry.agent_execution_id is None:
+                    continue
+                notes_by_execution_id[str(entry.agent_execution_id)].append(note_payload)
 
         agent_progress = []
         stages = []
@@ -258,11 +327,17 @@ class SessionDetailSerializer(serializers.ModelSerializer):
         if not current_stage and stages:
             current_stage = stages[-1]["stage_key"]
 
+        latest_ledger_sequence = (
+            max(run.latest_ledger_sequence, live_latest_sequence)
+            if use_live_entries
+            else run.latest_ledger_sequence
+        )
+
         return {
             "status": _coach_progress_status_from_run(run.status),
             "active_run_id": str(run.id),
             "run_index": run.run_index,
-            "latest_ledger_sequence": run.latest_ledger_sequence,
+            "latest_ledger_sequence": latest_ledger_sequence,
             "updated_at": run.updated_at.isoformat(),
             "current_stage": current_stage,
             "agent_progress": agent_progress,
