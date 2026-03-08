@@ -55,6 +55,30 @@ SUBAGENT_OUTPUT_SCHEMA: dict[str, Any] = {
 }
 
 DEFAULT_WINDOW_IMPRESSION = "No clear trend was detected in this window."
+SUBAGENT_SYSTEM_PROMPT = (
+    "You are a Speech Coach subagent operating on exactly one 30-second window.\n\n"
+    "Your role:\n"
+    "- Analyze only the provided WINDOW_INPUT_JSON for this window.\n"
+    "- Produce localized observations tied to events in this window.\n"
+    "- Do not make global/session-wide judgments.\n\n"
+    "Output contract:\n"
+    "- Return valid JSON only, matching the provided schema exactly.\n"
+    '- Required keys: "notes" (array), "impression" (string).\n'
+    '- Each note object must contain: "event_id", "note".\n'
+    "- Use only event_id values that exist in the input events list.\n"
+    "- At most one note per event_id.\n"
+    "- Do not add extra keys.\n\n"
+    "Reasoning policy:\n"
+    "- Prefer salient-only notes: include an event note only when there is a clear, meaningful signal.\n"
+    "- Keep notes objective, concise, and specific to what happened in this window.\n"
+    "- Avoid prescriptions, motivational language, or long explanations.\n"
+    "- If evidence is weak/noisy, skip the event instead of forcing a note.\n"
+    "- Never invent events, metrics, timestamps, or transcript content.\n\n"
+    "Impression policy:\n"
+    "- Write exactly one concise sentence summarizing the main local trend in this window.\n"
+    "- Keep it neutral and evidence-based.\n"
+    '- If no clear trend is present, output: "No clear trend was detected in this window."'
+)
 
 
 class SubagentWorkflowError(RuntimeError):
@@ -63,6 +87,14 @@ class SubagentWorkflowError(RuntimeError):
 
 class SubagentInputValidationError(SubagentWorkflowError):
     """Raised when subagent input payload shape is invalid."""
+
+
+def _resolve_subagent_system_prompt() -> str:
+    """Return the deterministic configured subagent system prompt constant."""
+    prompt = str(SUBAGENT_SYSTEM_PROMPT).strip()
+    if not prompt:
+        raise SubagentWorkflowError("SUBAGENT_SYSTEM_PROMPT cannot be blank.")
+    return prompt
 
 
 def _normalize_window_bounds(*, window_start_ms: int, window_end_ms: int) -> tuple[int, int]:
@@ -237,13 +269,12 @@ def run_subagent_execution(
     *,
     execution_id: str,
     session_id: str,
-    system_prompt: str,
     events: list[dict[str, Any]],
     word_map: list[dict[str, Any]],
     metadata: dict[str, Any] | None = None,
     graph: Any | None = None,
 ) -> dict[str, Any]:
-    """Run one subagent execution and append live-ledger notes and impression entries."""
+    """Run one subagent execution using deterministic prompt and append ledger updates."""
     execution = CoachAgentExecution.objects.select_related("run__session").get(id=execution_id)
     run = execution.run
     if str(run.session_id) != str(session_id):
@@ -294,9 +325,10 @@ def run_subagent_execution(
             **dict(metadata or {}),
         }
         user_prompt = _build_subagent_user_prompt(request_payload=request_payload)
+        resolved_system_prompt = _resolve_subagent_system_prompt()
 
         reasoning_result = run_subagent_structured_reasoning(
-            system_prompt=system_prompt,
+            system_prompt=resolved_system_prompt,
             user_prompt=user_prompt,
             structured_schema=SUBAGENT_OUTPUT_SCHEMA,
             metadata=request_metadata,

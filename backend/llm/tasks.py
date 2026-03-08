@@ -13,7 +13,6 @@ def run_subagent_window_task(
     *,
     execution_id: str,
     session_id: str,
-    system_prompt: str,
     events: list[dict[str, Any]],
     word_map: list[dict[str, Any]],
     metadata: dict[str, Any] | None = None,
@@ -22,7 +21,6 @@ def run_subagent_window_task(
     return run_subagent_execution(
         execution_id=execution_id,
         session_id=session_id,
-        system_prompt=system_prompt,
         events=events,
         word_map=word_map,
         metadata=metadata,

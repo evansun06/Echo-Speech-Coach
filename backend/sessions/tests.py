@@ -5,7 +5,7 @@ import types
 import unittest
 from io import StringIO
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -20,6 +20,7 @@ from rest_framework.test import APIClient
 
 from llm.coach_graph import build_reasoning_graph, run_reasoning_graph
 from llm.enqueue import (
+    enqueue_full_coach_workflow_job,
     enqueue_flagship_final_reconciliation_job,
     enqueue_subagent_finalize_job,
     enqueue_subagent_window_job,
@@ -47,6 +48,7 @@ from llm.ledger import (
 from llm.provider import ModelConfigurationError, ReasoningModels, build_reasoning_models
 from llm.schemas import ReasoningInput, ReasoningResult
 from llm.subagent_workflow import (
+    SUBAGENT_SYSTEM_PROMPT,
     SubagentInputValidationError,
     finalize_subagent_run,
     run_subagent_execution,
@@ -131,7 +133,6 @@ class SubagentEnqueueWrapperTests(SimpleTestCase):
         async_result, execution_id = enqueue_subagent_window_job(
             run=queued_run,
             session_id="session-1",
-            system_prompt="system prompt",
             window_start_ms=0,
             window_end_ms=30_000,
             events=[{"event_id": "e-1"}],
@@ -177,7 +178,6 @@ class SubagentEnqueueWrapperTests(SimpleTestCase):
         jobs = enqueue_subagent_window_jobs(
             run=run,
             session_id="session-1",
-            system_prompt="system prompt",
             windows=windows,
         )
 
@@ -233,6 +233,147 @@ class FlagshipFinalEnqueueWrapperTests(SimpleTestCase):
             kwargs={"run_id": "run-1", "system_prompt": "custom final prompt"}
         )
         self.assertEqual(async_result.id, "flagship-final-task-2")
+
+
+class FullWorkflowEnqueueWrapperTests(SimpleTestCase):
+    @patch("llm.enqueue.chord")
+    @patch("llm.enqueue.chain")
+    @patch("llm.enqueue.run_flagship_final_reconcile_task.si")
+    @patch("llm.enqueue.finalize_subagent_run_task.si")
+    @patch("llm.enqueue.run_subagent_window_task.si")
+    @patch("llm.enqueue.create_subagent_execution_for_window")
+    @patch("llm.enqueue.create_orchestration_run")
+    @patch("llm.enqueue.CoachingSession.objects.get")
+    def test_enqueue_full_coach_workflow_job_dispatches_subagents_then_finalize_chain(
+        self,
+        session_get_mock,
+        create_run_mock,
+        create_execution_mock,
+        subagent_signature_mock,
+        finalize_signature_mock,
+        flagship_signature_mock,
+        chain_mock,
+        chord_mock,
+    ):
+        session = SimpleNamespace(
+            id="session-1",
+            status=SessionStatus.ML_READY,
+            save=MagicMock(),
+        )
+        run = SimpleNamespace(id="run-1")
+        session_get_mock.return_value = session
+        create_run_mock.return_value = run
+        create_execution_mock.side_effect = [
+            SimpleNamespace(id="exec-1"),
+            SimpleNamespace(id="exec-2"),
+        ]
+        subagent_signature_mock.side_effect = [
+            SimpleNamespace(name="subagent-1"),
+            SimpleNamespace(name="subagent-2"),
+        ]
+        finalize_signature = SimpleNamespace(name="finalize")
+        flagship_signature = SimpleNamespace(name="flagship-final")
+        finalize_signature_mock.return_value = finalize_signature
+        flagship_signature_mock.return_value = flagship_signature
+        completion_chain = SimpleNamespace(name="completion-chain")
+        chain_mock.return_value = completion_chain
+        workflow_async_result = SimpleNamespace(id="workflow-task-1")
+        chord_invoker = MagicMock(return_value=workflow_async_result)
+        chord_mock.return_value = chord_invoker
+
+        result = enqueue_full_coach_workflow_job(
+            session_id="session-1",
+            windows=[
+                {
+                    "window_start_ms": 30_000,
+                    "window_end_ms": 60_000,
+                    "events": [{"event_id": "b"}],
+                    "word_map": [{"word": "b"}],
+                    "metadata": {"window": "b"},
+                },
+                {
+                    "window_start_ms": 0,
+                    "window_end_ms": 30_000,
+                    "events": [{"event_id": "a"}],
+                    "word_map": [{"word": "a"}],
+                    "metadata": {"window": "a"},
+                },
+            ],
+            subagent_metadata={"shared": "yes"},
+            flagship_final_system_prompt="flagship prompt",
+        )
+
+        self.assertEqual(session.status, SessionStatus.PROCESSING_COACH)
+        session.save.assert_called_once_with(update_fields=["status", "updated_at"])
+        create_run_mock.assert_called_once_with(session=session)
+        self.assertEqual(create_execution_mock.call_count, 2)
+        first_create_kwargs = create_execution_mock.call_args_list[0].kwargs
+        second_create_kwargs = create_execution_mock.call_args_list[1].kwargs
+        self.assertEqual(first_create_kwargs["window_start_ms"], 0)
+        self.assertEqual(second_create_kwargs["window_start_ms"], 30_000)
+        finalize_signature_mock.assert_called_once_with(run_id="run-1")
+        flagship_signature_mock.assert_called_once_with(
+            run_id="run-1",
+            system_prompt="flagship prompt",
+        )
+        chain_mock.assert_called_once_with(finalize_signature, flagship_signature)
+        chord_invoker.assert_called_once_with(completion_chain)
+        self.assertEqual(result["run_id"], "run-1")
+        self.assertEqual(result["workflow_task_id"], "workflow-task-1")
+        self.assertEqual(result["subagent_task_count"], 2)
+        self.assertEqual(result["subagent_execution_ids"], ["exec-1", "exec-2"])
+
+    @patch("llm.enqueue.chord")
+    @patch("llm.enqueue.chain")
+    @patch("llm.enqueue.run_flagship_final_reconcile_task.si")
+    @patch("llm.enqueue.finalize_subagent_run_task.si")
+    @patch("llm.enqueue.run_subagent_window_task.si")
+    @patch("llm.enqueue.create_subagent_execution_for_window")
+    @patch("llm.enqueue.create_orchestration_run")
+    @patch("llm.enqueue.CoachingSession.objects.get")
+    def test_enqueue_full_coach_workflow_job_without_windows_dispatches_chain_only(
+        self,
+        session_get_mock,
+        create_run_mock,
+        create_execution_mock,
+        subagent_signature_mock,
+        finalize_signature_mock,
+        flagship_signature_mock,
+        chain_mock,
+        chord_mock,
+    ):
+        session = SimpleNamespace(
+            id="session-1",
+            status=SessionStatus.PROCESSING_COACH,
+            save=MagicMock(),
+        )
+        run = SimpleNamespace(id="run-1")
+        session_get_mock.return_value = session
+        create_run_mock.return_value = run
+        finalize_signature = SimpleNamespace(name="finalize")
+        flagship_signature = SimpleNamespace(name="flagship-final")
+        finalize_signature_mock.return_value = finalize_signature
+        flagship_signature_mock.return_value = flagship_signature
+        workflow_async_result = SimpleNamespace(id="workflow-task-2")
+        completion_chain = SimpleNamespace(
+            name="completion-chain",
+            apply_async=MagicMock(return_value=workflow_async_result),
+        )
+        chain_mock.return_value = completion_chain
+
+        result = enqueue_full_coach_workflow_job(
+            session_id="session-1",
+            windows=[],
+        )
+
+        session.save.assert_not_called()
+        create_execution_mock.assert_not_called()
+        subagent_signature_mock.assert_not_called()
+        flagship_signature_mock.assert_called_once_with(run_id="run-1")
+        completion_chain.apply_async.assert_called_once_with()
+        chord_mock.assert_not_called()
+        self.assertEqual(result["workflow_task_id"], "workflow-task-2")
+        self.assertEqual(result["subagent_task_count"], 0)
 
 
 class FlagshipFinalTaskTests(SimpleTestCase):
@@ -896,7 +1037,6 @@ class SubagentWorkflowServiceTests(TestCase):
         result = run_subagent_execution(
             execution_id=str(self.execution.id),
             session_id=str(self.session.id),
-            system_prompt="system prompt",
             events=[
                 {
                     "event_id": "event-1",
@@ -928,6 +1068,10 @@ class SubagentWorkflowServiceTests(TestCase):
         self.assertEqual(self.execution.output_seq_to, 3)
         self.assertEqual(self.run.status, CoachOrchestrationRunStatus.PROCESSING)
         self.assertEqual(append_live_mock.call_count, 3)
+        self.assertEqual(
+            run_reasoning_mock.call_args.kwargs["system_prompt"],
+            SUBAGENT_SYSTEM_PROMPT,
+        )
 
     @patch("llm.subagent_workflow.run_subagent_structured_reasoning")
     def test_run_subagent_execution_validates_event_shape_before_model_call(
@@ -938,7 +1082,6 @@ class SubagentWorkflowServiceTests(TestCase):
             run_subagent_execution(
                 execution_id=str(self.execution.id),
                 session_id=str(self.session.id),
-                system_prompt="system prompt",
                 events=[
                     {
                         "event_id": "event-1",
