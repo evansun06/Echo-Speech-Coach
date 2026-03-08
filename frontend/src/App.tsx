@@ -2,6 +2,7 @@ import { CircularProgress, Stack, Typography } from '@mui/material'
 import { useEffect, useState } from 'react'
 import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 import api from './api'
+import SplashScreen from './components/SplashScreen'
 import DashboardPage from './pages/DashboardPage'
 import HomePage from './pages/HomePage'
 import LoginPage from './pages/LoginPage'
@@ -71,6 +72,12 @@ function AppRoutes() {
 }
 
 function App() {
+  const [showSplash, setShowSplash] = useState(true)
+
+  if (showSplash) {
+    return <SplashScreen onDone={() => setShowSplash(false)} />
+  }
+
   return (
     <BrowserRouter>
       <AppRoutes />

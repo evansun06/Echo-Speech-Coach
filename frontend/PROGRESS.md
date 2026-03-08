@@ -1,4 +1,9 @@
 ## Current State
+- Google Workspace-inspired global MUI theme applied (`src/theme.ts`) with shared palette, typography, shape, and component overrides
+- App-wide font loading added for Google Sans + Roboto (Google Fonts in `index.html`)
+- First-load splash screen added (`src/components/SplashScreen.tsx`) and wired in `App.tsx`
+- Dashboard status animations added via inline `StatusIndicator` in `DashboardPage.tsx`
+- `processing_coach` synthesis loading indicator added in `CoachPanelContent` above coach panel content
 - Auth: complete, connected to real Django backend
 - Home page: complete, session list connected to real backend
 - Session creation modal: complete, connected to real backend, named sessions

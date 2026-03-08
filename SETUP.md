@@ -33,6 +33,9 @@ scripts/hybrid-celery.sh
   - `$HOME/.config/gcloud/application_default_credentials.json`
 - Ensure `.env` contains:
   - `GOOGLE_CLOUD_PROJECT=<your-project-id>`
+- Ensure `.env.gemini` contains:
+  - `GEMINI_API_KEY=<your-key>`
+  - `GEMINI_CHAT_MODEL=<model-id>`
 
 ## Stop Infra
 

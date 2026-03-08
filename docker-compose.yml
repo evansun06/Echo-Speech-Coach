@@ -6,7 +6,10 @@ services:
       dockerfile: Dockerfile
     command: python manage.py runserver 0.0.0.0:8000
     env_file:
-      - .env
+      - path: .env
+        required: true
+      - path: .env.gemini
+        required: false
     environment:
       - MEDIA_ROOT=${MEDIA_ROOT:-/app/media}
       - MEDIA_URL=${MEDIA_URL:-/media/}
@@ -40,7 +43,10 @@ services:
     build: ./backend
     command: celery -A config worker -l ${CELERY_WORKER_LOGLEVEL:-info} -E
     env_file:
-      - .env
+      - path: .env
+        required: true
+      - path: .env.gemini
+        required: false
     environment:
       - MEDIA_ROOT=${MEDIA_ROOT:-/app/media}
       - MEDIA_URL=${MEDIA_URL:-/media/}
@@ -62,7 +68,10 @@ services:
     profiles: ["telemetry"]
     command: celery --broker=${CELERY_BROKER_URL} flower --port=${FLOWER_PORT:-5555} --basic-auth=${FLOWER_BASIC_AUTH}
     env_file:
-      - .env
+      - path: .env
+        required: true
+      - path: .env.gemini
+        required: false
     ports:
       - "${FLOWER_PORT:-5555}:${FLOWER_PORT:-5555}"
     depends_on:

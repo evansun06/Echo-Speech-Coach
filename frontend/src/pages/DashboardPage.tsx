@@ -229,6 +229,26 @@ function sortAgentProgressChronologically(agentProgress: CoachAgentProgress[]): 
   })
 }
 
+function StatusIndicator({ status }: { status: SessionStatus }) {
+  if (status === 'ready' || status === 'failed' || status === 'coach_failed') {
+    const color = status === 'ready' ? 'success' : status === 'failed' ? 'error' : 'warning'
+    return <Chip size="small" label={formatStatusLabel(status)} color={color} />
+  }
+
+  if (status === 'queued_ml' || status === 'processing_ml' || status === 'ml_ready' || status === 'processing_coach') {
+    return (
+      <Stack direction="row" spacing={1} alignItems="center">
+        <LinearProgress variant="indeterminate" sx={{ width: 80, borderRadius: 2, height: 6 }} />
+        <Typography variant="caption" color="text.secondary">
+          {formatStatusLabel(status)}
+        </Typography>
+      </Stack>
+    )
+  }
+
+  return <Chip size="small" label={formatStatusLabel(status)} />
+}
+
 function ReconciliationHero({ finalReconciliation }: { finalReconciliation: CoachFinalReconciliation }) {
   return (
     <Card
@@ -418,6 +438,18 @@ function CoachPanelContent({
 
       {retryError && <Alert severity="error">{retryError}</Alert>}
 
+      {session.status === 'processing_coach' && (
+        <Stack spacing={1}>
+          <Stack direction="row" spacing={1} alignItems="center">
+            <CircularProgress size={14} thickness={5} />
+            <Typography variant="caption" color="text.secondary">
+              Gemini is synthesizing your coaching report…
+            </Typography>
+          </Stack>
+          <LinearProgress variant="indeterminate" sx={{ borderRadius: 2, height: 4 }} />
+        </Stack>
+      )}
+
       {!coachProgress ? (
         <Alert severity="info">Coach progress is not available yet.</Alert>
       ) : (
@@ -579,7 +611,8 @@ function ChatPanel({ sessionId, sessionStatus }: { sessionId: string; sessionSta
     }
   }
 
-  const showStreamingAssistant = isSending && (streamingReasoning.length > 0 || streamingAnswer.length > 0)
+  const hasStreamingReasoning = streamingReasoning.trim().length > 0
+  const showStreamingAssistant = isSending && streamingAnswer.length > 0
 
   return (
     <Stack spacing={1.5} sx={{ height: '100%' }}>
@@ -663,20 +696,22 @@ function ChatPanel({ sessionId, sessionStatus }: { sessionId: string; sessionSta
                       Coach • {formatChatTimestamp(new Date().toISOString())}
                     </Typography>
 
-                    <Stack spacing={0.5}>
-                      <Button
-                        size="small"
-                        onClick={() => setStreamingReasoningCollapsed((previous) => !previous)}
-                        sx={{ alignSelf: 'flex-start', px: 0, minWidth: 0 }}
-                      >
-                        {streamingReasoningCollapsed ? 'Show Reasoning…' : 'Hide Reasoning…'}
-                      </Button>
-                      <Collapse in={!streamingReasoningCollapsed}>
-                        <Typography variant="body2" sx={{ fontStyle: 'italic', color: 'text.secondary' }}>
-                          {streamingReasoning || 'Reasoning...'}
-                        </Typography>
-                      </Collapse>
-                    </Stack>
+                    {hasStreamingReasoning && (
+                      <Stack spacing={0.5}>
+                        <Button
+                          size="small"
+                          onClick={() => setStreamingReasoningCollapsed((previous) => !previous)}
+                          sx={{ alignSelf: 'flex-start', px: 0, minWidth: 0 }}
+                        >
+                          {streamingReasoningCollapsed ? 'Show Reasoning…' : 'Hide Reasoning…'}
+                        </Button>
+                        <Collapse in={!streamingReasoningCollapsed}>
+                          <Typography variant="body2" sx={{ fontStyle: 'italic', color: 'text.secondary' }}>
+                            {streamingReasoning}
+                          </Typography>
+                        </Collapse>
+                      </Stack>
+                    )}
 
                     <Typography variant="body2">{streamingAnswer || 'Generating final answer...'}</Typography>
                   </Stack>
@@ -1179,7 +1214,7 @@ function DashboardPage() {
                 <Typography variant="body2" color="text.secondary">
                   Session ID: {session.id}
                 </Typography>
-                <Chip size="small" label={formatStatusLabel(session.status)} />
+                <StatusIndicator status={session.status} />
               </Stack>
             )}
           </Stack>

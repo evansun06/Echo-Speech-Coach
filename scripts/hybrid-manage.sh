@@ -16,6 +16,13 @@ if [ -f "$ROOT_DIR/.env" ]; then
   set +a
 fi
 
+if [ -f "$ROOT_DIR/.env.gemini" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ROOT_DIR/.env.gemini"
+  set +a
+fi
+
 export DJANGO_SETTINGS_MODULE="${DJANGO_SETTINGS_MODULE:-config.settings.dev}"
 export DB_HOST="${HYBRID_DB_HOST:-localhost}"
 export DB_PORT="${HYBRID_DB_PORT:-5433}"

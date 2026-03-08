@@ -172,6 +172,8 @@ GEMINI_SUBAGENT_MODEL = os.getenv("GEMINI_SUBAGENT_MODEL", "gemini-2.0-flash")
 GEMINI_PRIMARY_MODEL = os.getenv("GEMINI_PRIMARY_MODEL", "gemini-3.0-pro")
 GEMINI_SUBAGENT_TEMPERATURE = float(os.getenv("GEMINI_SUBAGENT_TEMPERATURE", "0.2"))
 GEMINI_PRIMARY_TEMPERATURE = float(os.getenv("GEMINI_PRIMARY_TEMPERATURE", "0.1"))
+GEMINI_CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.5-flash")
+GEMINI_CHAT_TEMPERATURE = float(os.getenv("GEMINI_CHAT_TEMPERATURE", "0.2"))
 GEMINI_FLAGSHIP_FINAL_SYSTEM_PROMPT = os.getenv(
     "GEMINI_FLAGSHIP_FINAL_SYSTEM_PROMPT",
     "You are the final speech coaching synthesis model. Read the full ledger and "

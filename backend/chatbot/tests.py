@@ -4,7 +4,6 @@ from django.test import TestCase
 from rest_framework import status
 from rest_framework.test import APIClient
 from unittest.mock import patch
-from types import SimpleNamespace
 
 from sessions.models import (
     CoachAgentKind,
@@ -225,8 +224,8 @@ class ChatApiEndpointTests(TestCase):
         response = self.client.get(self._history_url(self.other_user_session))
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
-    @patch("chatbot.views.run_subagent_reasoning")
-    def test_stream_chat_response_generates_and_completes_from_queued(self, run_reasoning_mock):
+    @patch("chatbot.views.stream_chat_response_tokens")
+    def test_stream_chat_response_generates_and_completes_from_queued(self, stream_tokens_mock):
         completed_run = CoachOrchestrationRun.objects.create(
             session=self.ready_session,
             run_index=1,
@@ -254,9 +253,11 @@ class ChatApiEndpointTests(TestCase):
         user_message.response = queued_response
         user_message.save(update_fields=["response"])
 
-        run_reasoning_mock.return_value = SimpleNamespace(
-            output_text="Focus on slower transitions and cleaner openings."
-        )
+        stream_tokens_mock.return_value = [
+            "Focus on ",
+            "slower transitions ",
+            "and cleaner openings.",
+        ]
 
         response = self.client.get(
             self._stream_url(self.ready_session, str(queued_response.response_id))
@@ -268,8 +269,8 @@ class ChatApiEndpointTests(TestCase):
         self.assertIn("event: start", body)
         self.assertIn("event: token", body)
         self.assertIn("event: complete", body)
-        run_reasoning_mock.assert_called_once()
-        prompt = run_reasoning_mock.call_args.kwargs["user_prompt"]
+        stream_tokens_mock.assert_called_once()
+        prompt = stream_tokens_mock.call_args.kwargs["user_prompt"]
         self.assertIn("LATEST_FINALIZED_LEDGER", prompt)
         self.assertIn("Final summary: improve transitions and pacing.", prompt)
 
@@ -278,8 +279,8 @@ class ChatApiEndpointTests(TestCase):
         self.assertTrue(queued_response.answer_text)
         self.assertIsNotNone(queued_response.assistant_message_id)
 
-    @patch("chatbot.views.run_subagent_reasoning")
-    def test_stream_chat_response_replays_completed_response(self, run_reasoning_mock):
+    @patch("chatbot.views.stream_chat_response_tokens")
+    def test_stream_chat_response_replays_completed_response(self, stream_tokens_mock):
         assistant_message = ChatMessage.objects.create(
             session=self.ready_session,
             role=ChatMessageRole.ASSISTANT,
@@ -301,7 +302,30 @@ class ChatApiEndpointTests(TestCase):
         self.assertIn("event: token", body)
         self.assertIn("Replay", body)
         self.assertIn("event: complete", body)
-        run_reasoning_mock.assert_not_called()
+        stream_tokens_mock.assert_not_called()
+
+    def test_stream_chat_response_accepts_text_event_stream_header(self):
+        assistant_message = ChatMessage.objects.create(
+            session=self.ready_session,
+            role=ChatMessageRole.ASSISTANT,
+            content="Replay answer.",
+        )
+        completed_response = ChatResponse.objects.create(
+            session=self.ready_session,
+            assistant_message=assistant_message,
+            status=ChatResponseStatus.COMPLETED,
+            answer_text="Replay answer.",
+        )
+
+        response = self.client.get(
+            self._stream_url(self.ready_session, str(completed_response.response_id)),
+            HTTP_ACCEPT="text/event-stream",
+        )
+        body = self._stream_body(response)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response["Content-Type"], "text/event-stream")
+        self.assertIn("event: token", body)
 
     def test_stream_chat_response_emits_failed_error_event(self):
         failed_response = ChatResponse.objects.create(
@@ -332,8 +356,8 @@ class ChatApiEndpointTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
         self.assertIn("detail", response.data)
 
-    @patch("chatbot.views.run_subagent_reasoning")
-    def test_stream_chat_response_marks_failed_when_generation_raises(self, run_reasoning_mock):
+    @patch("chatbot.views.stream_chat_response_tokens")
+    def test_stream_chat_response_marks_failed_when_generation_raises(self, stream_tokens_mock):
         user_message = ChatMessage.objects.create(
             session=self.ready_session,
             role=ChatMessageRole.USER,
@@ -346,7 +370,7 @@ class ChatApiEndpointTests(TestCase):
         )
         user_message.response = queued_response
         user_message.save(update_fields=["response"])
-        run_reasoning_mock.side_effect = RuntimeError("Gemini error")
+        stream_tokens_mock.side_effect = RuntimeError("Gemini error")
 
         response = self.client.get(
             self._stream_url(self.ready_session, str(queued_response.response_id))
