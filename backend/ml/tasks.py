@@ -82,7 +82,7 @@ def _extract_audio_from_video(
             )
     except FileNotFoundError:
         logger.warning(
-            "ffmpeg is not installed; falling back to bundled sample media for session %s.",
+            "ffmpeg is not installed; audio extraction cannot run for session %s.",
             session_id,
         )
         return None
@@ -112,42 +112,63 @@ def _extract_audio_from_video(
 
 
 def _resolve_ml_media_inputs(*, session: CoachingSession) -> dict[str, str]:
-    sample_audio_path, sample_video_path = _default_sample_media_paths()
-    if not sample_audio_path.exists() or not sample_video_path.exists():
-        raise RuntimeError("Bundled fallback media files are missing in backend/ml.")
+    allow_sample_fallback = bool(getattr(settings, "ML_ALLOW_SAMPLE_FALLBACK", False))
 
-    fallback_reason = "missing_session_video"
-    session_video_path: Path | None = None
-    if session.video_file:
-        try:
-            maybe_video_path = Path(session.video_file.path)
-        except (ValueError, NotImplementedError):
-            fallback_reason = "unavailable_session_video_path"
-        else:
-            if maybe_video_path.exists():
-                session_video_path = maybe_video_path
-            else:
-                fallback_reason = "session_video_file_missing_on_disk"
+    def _resolve_sample_fallback(*, reason: str) -> dict[str, str]:
+        if not allow_sample_fallback:
+            if reason == "failed_audio_extract_from_session_video":
+                raise RuntimeError(
+                    "Session media audio extraction failed. "
+                    "Ensure ffmpeg is installed and the uploaded video contains a valid audio track."
+                )
+            raise RuntimeError(
+                "Session media is unavailable for ML analysis "
+                f"(reason={reason})."
+            )
 
-    if session_video_path is not None:
-        extracted_audio_path = _extract_audio_from_video(
-            session_id=str(session.id),
-            video_path=session_video_path,
+        sample_audio_path, sample_video_path = _default_sample_media_paths()
+        if not sample_audio_path.exists() or not sample_video_path.exists():
+            raise RuntimeError(
+                "Sample fallback is enabled but bundled fallback media files are missing in backend/ml."
+            )
+
+        logger.warning(
+            "ML sample fallback enabled | session_id=%s reason=%s audio_path=%s video_path=%s",
+            session.id,
+            reason,
+            str(sample_audio_path),
+            str(sample_video_path),
         )
-        if extracted_audio_path is not None:
-            return {
-                "audio_path": str(extracted_audio_path),
-                "video_path": str(session_video_path),
-                "source": "session_media",
-                "fallback_reason": "",
-            }
-        fallback_reason = "failed_audio_extract_from_session_video"
+        return {
+            "audio_path": str(sample_audio_path),
+            "video_path": str(sample_video_path),
+            "source": "sample_fallback",
+            "fallback_reason": reason,
+        }
+
+    if not session.video_file:
+        return _resolve_sample_fallback(reason="missing_session_video")
+
+    try:
+        session_video_path = Path(session.video_file.path)
+    except (ValueError, NotImplementedError):
+        return _resolve_sample_fallback(reason="unavailable_session_video_path")
+
+    if not session_video_path.exists():
+        return _resolve_sample_fallback(reason="session_video_file_missing_on_disk")
+
+    extracted_audio_path = _extract_audio_from_video(
+        session_id=str(session.id),
+        video_path=session_video_path,
+    )
+    if extracted_audio_path is None:
+        return _resolve_sample_fallback(reason="failed_audio_extract_from_session_video")
 
     return {
-        "audio_path": str(sample_audio_path),
-        "video_path": str(sample_video_path),
-        "source": "sample_fallback",
-        "fallback_reason": fallback_reason,
+        "audio_path": str(extracted_audio_path),
+        "video_path": str(session_video_path),
+        "source": "session_media",
+        "fallback_reason": "",
     }
 
 

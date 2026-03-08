@@ -23,6 +23,7 @@ import api from '../api'
 import type { ApiError, CoachingSessionListItem, SessionAssetsPayload } from '../api'
 
 type VideoSource = 'upload' | 'record'
+const MAX_VIDEO_FILE_SIZE_BYTES = 50 * 1024 * 1024
 
 
 function formatCreatedDate(value: string): string {
@@ -235,17 +236,16 @@ function HomePage() {
     setIsCameraLoading(true)
 
     try {
-      let stream: MediaStream
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: true,
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      })
+
+      if (stream.getAudioTracks().length === 0) {
+        stream.getTracks().forEach((track) => {
+          track.stop()
         })
-      } catch {
-        stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: false,
-        })
+        throw new Error('Microphone access is required to record analyzable sessions.')
       }
 
       mediaStreamRef.current = stream
@@ -286,6 +286,10 @@ function HomePage() {
       setModalError('Camera is not ready. Wait for preview before recording.')
       return
     }
+    if (stream.getAudioTracks().length === 0) {
+      setModalError('Microphone is required for recording. Enable microphone access and try again.')
+      return
+    }
 
     try {
       const supportedMimeTypes = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm']
@@ -321,6 +325,11 @@ function HomePage() {
         const recordedFile = new File([blob], `recording-${Date.now()}.webm`, {
           type: blob.type || 'video/webm',
         })
+        if (recordedFile.size > MAX_VIDEO_FILE_SIZE_BYTES) {
+          setVideoFile(null)
+          setModalError('Recorded video exceeds 50MB. Please keep recordings shorter.')
+          return
+        }
 
         setVideoFile(recordedFile)
         setModalError(null)
@@ -401,6 +410,12 @@ function HomePage() {
 
   const handleVideoFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0] ?? null
+    if (file && file.size > MAX_VIDEO_FILE_SIZE_BYTES) {
+      setVideoFile(null)
+      setModalError('Video file must be 50MB or smaller.')
+      event.target.value = ''
+      return
+    }
     setVideoFile(file)
     setModalError(null)
   }
@@ -621,7 +636,7 @@ function HomePage() {
                       <Stack spacing={1}>
                         <Typography variant="h6">Record Now</Typography>
                         <Typography color="text.secondary" variant="body2">
-                          Placeholder for in-browser recording.
+                          Capture video and microphone audio directly in your browser.
                         </Typography>
                       </Stack>
                     </CardActionArea>
@@ -659,7 +674,7 @@ function HomePage() {
                         {videoFile ? `Selected: ${videoFile.name}` : 'No file selected'}
                       </Typography>
                       <Typography color="text.secondary" variant="caption">
-                        One video per session. Multiple uploads are not allowed.
+                        One video per session. Max file size: 50MB.
                       </Typography>
                     </>
                   ) : (
@@ -729,7 +744,7 @@ function HomePage() {
                         {videoFile ? `Recorded: ${videoFile.name}` : 'No recording captured yet'}
                       </Typography>
                       <Typography color="text.secondary" variant="caption">
-                        One video per session. Multiple uploads are not allowed.
+                        One video per session. Max file size: 50MB.
                       </Typography>
                     </>
                   )}

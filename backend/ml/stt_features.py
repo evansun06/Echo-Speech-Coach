@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 FILLER_WORDS = {
     "um", "uh", "erm", "ah", "like", "you know", "i mean", "sort of", "kind of"
 }
+SYNC_RECOGNIZE_API_PAYLOAD_LIMIT_BYTES = 10_485_760
+DEFAULT_SYNC_RECOGNIZE_MAX_PAYLOAD_BYTES = 9_500_000
 
 
 @dataclass
@@ -52,6 +54,41 @@ def _normalize_word(word: str) -> str:
 
 def _is_sentence_end(word: str) -> bool:
     return word.endswith((".", "!", "?"))
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; falling back to %s.",
+            name,
+            raw_value,
+            default,
+        )
+        return default
+    return max(parsed, 1)
+
+
+def _resolve_max_sync_payload_bytes() -> int:
+    requested_payload_limit = _env_positive_int(
+        "ML_STT_SYNC_MAX_PAYLOAD_BYTES",
+        DEFAULT_SYNC_RECOGNIZE_MAX_PAYLOAD_BYTES,
+    )
+    payload_limit = min(
+        requested_payload_limit,
+        SYNC_RECOGNIZE_API_PAYLOAD_LIMIT_BYTES,
+    )
+    if payload_limit != requested_payload_limit:
+        logger.warning(
+            "ML_STT_SYNC_MAX_PAYLOAD_BYTES=%s exceeds API limit; clamping to %s.",
+            requested_payload_limit,
+            payload_limit,
+        )
+    return payload_limit
 
 def transcribe_words_google(
     audio_path: str,
@@ -90,6 +127,13 @@ def transcribe_words_google(
         os.getpid(),
     )
     client = speech.SpeechClient(transport=transport)
+    max_payload_bytes = _resolve_max_sync_payload_bytes()
+    if file_size_bytes > max_payload_bytes:
+        raise ValueError(
+            "Audio payload exceeds sync STT limit. "
+            f"file_size_bytes={file_size_bytes} max_allowed_bytes={max_payload_bytes}. "
+            "Upload a shorter/smaller video."
+        )
     with open(audio_file, "rb") as f:
         content = f.read()
 
@@ -103,8 +147,9 @@ def transcribe_words_google(
         enable_word_confidence=True,
         enable_automatic_punctuation=True,
     )
-
-    t0 = time.time()
+    request_t0 = time.time()
+    words: List[WordItem] = []
+    transcript_parts: List[str] = []
     try:
         response = client.recognize(
             config=config,
@@ -116,33 +161,28 @@ def transcribe_words_google(
             "STT request failed | error_type=%s timeout_sec=%.1f elapsed_sec=%.3f",
             type(exc).__name__,
             timeout_seconds,
-            time.time() - t0,
+            time.time() - request_t0,
         )
         raise
-    rpc_duration_sec = time.time() - t0
-    # print("\n=== RAW GOOGLE STT RESPONSE ===")
-    # print("num results:", len(response.results))
-    # for i, result in enumerate(response.results):
-    #     alt = result.alternatives[0]
-    #     print(f"\nResult {i} transcript:", alt.transcript)
-    #     for w in alt.words[:10]:
-    #         print(w.word, w.start_time, w.end_time, getattr(w, "confidence", None))
-    # print("=== END RESPONSE ===\n")
-    
-    words: List[WordItem] = []
-    transcript_parts: List[str] = []
 
     for result in response.results:
+        if not result.alternatives:
+            continue
         alt = result.alternatives[0]
-        transcript_parts.append(alt.transcript)
-
-        for w in alt.words:
+        transcript = str(alt.transcript).strip()
+        if transcript:
+            transcript_parts.append(transcript)
+        for token in alt.words:
             words.append(
                 WordItem(
-                    word=w.word,
-                    start_sec=_duration_to_sec(w.start_time),
-                    end_sec=_duration_to_sec(w.end_time),
-                    confidence=float(w.confidence) if w.confidence is not None else None,
+                    word=token.word,
+                    start_sec=_duration_to_sec(token.start_time),
+                    end_sec=_duration_to_sec(token.end_time),
+                    confidence=(
+                        float(token.confidence)
+                        if token.confidence is not None
+                        else None
+                    ),
                 )
             )
 
@@ -161,10 +201,10 @@ def transcribe_words_google(
 
     transcript_text = " ".join(transcript_parts).strip()
     logger.info(
-        "STT request completed | results=%s words=%s rpc_duration_sec=%.3f",
+        "STT request completed | results=%s words=%s elapsed_sec=%.3f",
         len(response.results),
         len(word_df),
-        rpc_duration_sec,
+        time.time() - request_t0,
     )
     return word_df, transcript_text
 

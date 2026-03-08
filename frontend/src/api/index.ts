@@ -1,17 +1,3 @@
-function readBooleanEnv(value: string | undefined, defaultValue: boolean): boolean {
-  if (value === undefined) {
-    return defaultValue
-  }
-  const normalized = value.trim().toLowerCase()
-  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
-    return true
-  }
-  if (['0', 'false', 'no', 'off'].includes(normalized)) {
-    return false
-  }
-  return defaultValue
-}
-
 // Hackathon hard-switch: force real backend paths, ignore Vite mock/demo flags.
 export const CHAT_USE_MOCK = false
 export const SESSIONS_USE_MOCK = false
@@ -43,6 +29,7 @@ export type SessionStatus =
 export type CoachProgressStatus = 'pending' | 'processing_coach' | 'completed' | 'failed'
 
 export type CoachStageStatus = 'pending' | 'processing' | 'completed' | 'failed'
+export type CoachNoteKind = 'window_impression' | 'event_note' | 'general'
 
 export interface CoachNote {
   note_id: string
@@ -50,6 +37,10 @@ export interface CoachNote {
   body: string
   evidence_refs: string[]
   default_collapsed: boolean
+  note_kind: CoachNoteKind
+  event_id: string | null
+  event_type: string | null
+  sequence: number | null
 }
 
 export interface CoachStage {
@@ -73,6 +64,10 @@ export interface CoachAgentProgress {
   started_at: string | null
   completed_at: string | null
   last_heartbeat_at: string | null
+  model_name: string
+  window_label: string
+  window_impression: CoachNote | null
+  reasoning_events: CoachNote[]
 }
 
 export interface CoachLedgerEntry {
@@ -87,6 +82,16 @@ export interface CoachLedgerEntry {
   created_at: string
 }
 
+export interface CoachFinalReconciliation {
+  agent_name: string
+  model_name: string
+  overall_impression: string
+  strengths: string[]
+  improvements: string[]
+  priority_actions: string[]
+  created_at: string
+}
+
 export interface CoachProgress {
   status: CoachProgressStatus
   current_stage: string
@@ -97,6 +102,7 @@ export interface CoachProgress {
   agent_progress?: CoachAgentProgress[]
   stages: CoachStage[]
   ledger_entries?: CoachLedgerEntry[]
+  final_reconciliation?: CoachFinalReconciliation | null
 }
 
 export interface Annotation {

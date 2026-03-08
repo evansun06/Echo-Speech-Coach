@@ -9,8 +9,8 @@ import {
   CircularProgress,
   Collapse,
   Container,
-  Divider,
   Fade,
+  LinearProgress,
   Stack,
   Tab,
   Tabs,
@@ -24,8 +24,8 @@ import type {
   Annotation,
   ApiError,
   ChatMessage,
-  CoachLedgerEntry,
-  CoachNote,
+  CoachAgentProgress,
+  CoachFinalReconciliation,
   CoachProgress,
   CoachingSessionDetail,
   SessionStatus,
@@ -33,11 +33,15 @@ import type {
 
 const TERMINAL_STATUSES: SessionStatus[] = ['ready', 'failed', 'coach_failed']
 const TIMELINE_VISIBLE_STATUSES: SessionStatus[] = ['ml_ready', 'processing_coach', 'ready', 'coach_failed']
-const LIVE_NOTES_STATUSES: SessionStatus[] = ['processing_ml', 'ml_ready', 'processing_coach', 'coach_failed']
-const SEVERITY_COLOR = {
-  low: '#22c55e',
+const CONFIDENCE_COLOR = {
+  low: '#ef4444',
   medium: '#f59e0b',
-  high: '#ef4444',
+  high: '#22c55e',
+} as const
+const CONFIDENCE_BADGE_BG = {
+  low: 'rgba(239, 68, 68, 0.22)',
+  medium: 'rgba(245, 158, 11, 0.22)',
+  high: 'rgba(34, 197, 94, 0.22)',
 } as const
 const STAGE_STATUS_COLOR = {
   pending: '#6b7280',
@@ -45,20 +49,21 @@ const STAGE_STATUS_COLOR = {
   completed: '#22c55e',
   failed: '#ef4444',
 } as const
-const FALLBACK_LIVE_NOTES = [
-  'Opening pace is fast; likely adrenaline spike in first 20 seconds.',
-  'Filler words are clustering around transitions ("um", "so", "like").',
-  'Eye contact drops briefly when referencing remembered bullet points.',
-  'Delivery improves after first key point; cadence becomes more natural.',
-  'Hands pause at waist for long stretches; invite a few purposeful gestures.',
-  'Clarity is strongest when examples are concrete and story-driven.',
-  'Posture stays upright with occasional shoulder tension during tough claims.',
-  'Vocal emphasis on numbers is clear; less emphasis on conclusions.',
-  'Pauses before major points improve listener comprehension noticeably.',
-  'Closing section regains confidence and stronger camera connection.',
-]
+const TIMELINE_LANE_HEIGHT = 20
+const TIMELINE_LANE_GAP = 8
+const TIMELINE_VERTICAL_PADDING = 8
+const TIMELINE_BAR_HEIGHT = 14
 
 type LeftPanelTab = 'coach' | 'chat'
+type ConfidenceLevel = 'low' | 'medium' | 'high'
+type AnnotationSeverity = 'low' | 'medium' | 'high'
+
+type StackedTimelineAnnotation = {
+  annotation: Annotation
+  laneIndex: number
+  resolvedConfidence: number
+  confidenceLevel: ConfidenceLevel
+}
 
 type ChatUiMessage = ChatMessage & {
   reasoning?: string
@@ -77,6 +82,112 @@ function formatTimestamp(ms: number): string {
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = totalSeconds % 60
   return `${minutes}:${seconds.toString().padStart(2, '0')}`
+}
+
+function clampUnitInterval(value: number): number {
+  return Math.max(0, Math.min(1, value))
+}
+
+function parseUnknownNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value
+  }
+
+  if (typeof value === 'string') {
+    const parsedValue = Number(value)
+    if (Number.isFinite(parsedValue)) {
+      return parsedValue
+    }
+  }
+
+  return null
+}
+
+function parseAnnotationSeverity(value: unknown): AnnotationSeverity | null {
+  if (typeof value !== 'string') {
+    return null
+  }
+
+  const normalized = value.trim().toLowerCase()
+  if (normalized === 'low' || normalized === 'medium' || normalized === 'high') {
+    return normalized
+  }
+
+  return null
+}
+
+function resolveAnnotationConfidence(annotation: Annotation): number {
+  const metadataConfidence = parseUnknownNumber(annotation.metadata.confidence)
+  if (metadataConfidence !== null) {
+    return clampUnitInterval(metadataConfidence)
+  }
+
+  const fallbackConfidence = parseUnknownNumber(annotation.confidence)
+  if (fallbackConfidence !== null) {
+    return clampUnitInterval(fallbackConfidence)
+  }
+
+  return 0
+}
+
+function resolveAnnotationSeverity(annotation: Annotation): AnnotationSeverity | null {
+  return parseAnnotationSeverity(annotation.metadata.severity)
+}
+
+function getConfidenceLevel(confidence: number): ConfidenceLevel {
+  if (confidence >= 0.8) {
+    return 'high'
+  }
+
+  if (confidence >= 0.6) {
+    return 'medium'
+  }
+
+  return 'low'
+}
+
+function formatConfidencePercent(confidence: number): string {
+  return `${Math.round(clampUnitInterval(confidence) * 100)}%`
+}
+
+function buildStackedTimelineAnnotations(annotations: Annotation[]): StackedTimelineAnnotation[] {
+  const sortedAnnotations = [...annotations].sort((left, right) => {
+    if (left.start_ms !== right.start_ms) {
+      return left.start_ms - right.start_ms
+    }
+
+    if (left.end_ms !== right.end_ms) {
+      return left.end_ms - right.end_ms
+    }
+
+    return left.id.localeCompare(right.id)
+  })
+
+  const laneEndTimes: number[] = []
+  const stackedAnnotations: StackedTimelineAnnotation[] = []
+
+  for (const annotation of sortedAnnotations) {
+    const startMs = Math.max(0, annotation.start_ms)
+    const endMs = Math.max(startMs, annotation.end_ms)
+    let laneIndex = laneEndTimes.findIndex((laneEndMs) => laneEndMs <= startMs)
+
+    if (laneIndex === -1) {
+      laneIndex = laneEndTimes.length
+      laneEndTimes.push(endMs)
+    } else {
+      laneEndTimes[laneIndex] = endMs
+    }
+
+    const resolvedConfidence = resolveAnnotationConfidence(annotation)
+    stackedAnnotations.push({
+      annotation,
+      laneIndex,
+      resolvedConfidence,
+      confidenceLevel: getConfidenceLevel(resolvedConfidence),
+    })
+  }
+
+  return stackedAnnotations
 }
 
 function formatChatTimestamp(value: string): string {
@@ -100,97 +211,147 @@ function shouldShowTimeline(status: SessionStatus): boolean {
   return TIMELINE_VISIBLE_STATUSES.includes(status)
 }
 
-function shouldShowLiveNotes(status: SessionStatus): boolean {
-  return LIVE_NOTES_STATUSES.includes(status)
+function sortAgentProgressChronologically(agentProgress: CoachAgentProgress[]): CoachAgentProgress[] {
+  return [...agentProgress].sort((left, right) => {
+    const leftStart = left.window_start_ms === null ? Number.POSITIVE_INFINITY : left.window_start_ms
+    const rightStart = right.window_start_ms === null ? Number.POSITIVE_INFINITY : right.window_start_ms
+    if (leftStart !== rightStart) {
+      return leftStart - rightStart
+    }
+
+    const leftEnd = left.window_end_ms === null ? Number.POSITIVE_INFINITY : left.window_end_ms
+    const rightEnd = right.window_end_ms === null ? Number.POSITIVE_INFINITY : right.window_end_ms
+    if (leftEnd !== rightEnd) {
+      return leftEnd - rightEnd
+    }
+
+    return left.execution_index - right.execution_index
+  })
 }
 
-function FinalLedgerPanel({ entries }: { entries: CoachLedgerEntry[] }) {
+function ReconciliationHero({ finalReconciliation }: { finalReconciliation: CoachFinalReconciliation }) {
   return (
-    <Card variant="outlined">
+    <Card
+      variant="outlined"
+      sx={{
+        borderColor: '#1d4ed8',
+        bgcolor: 'transparent',
+        background: 'linear-gradient(135deg, #0b1220 0%, #1e293b 100%)',
+      }}
+    >
       <CardContent sx={{ p: 1.5, '&:last-child': { pb: 1.5 } }}>
-        <Stack spacing={1}>
-          <Typography variant="subtitle2">Final Ledger</Typography>
-          <Box
-            sx={{
-              borderRadius: 1,
-              border: '1px solid',
-              borderColor: 'grey.800',
-              bgcolor: '#101317',
-              color: '#b7c0cb',
-              minHeight: 180,
-              maxHeight: 320,
-              overflowY: 'auto',
-              px: 1.25,
-              py: 1,
-              fontFamily: '"IBM Plex Mono", "Fira Code", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
-              fontSize: 12,
-              lineHeight: 1.5,
-            }}
-          >
-            {entries.length === 0 ? (
-              <Typography component="div" sx={{ color: '#8f99a7', fontFamily: 'inherit', fontSize: 'inherit' }}>
-                Final ledger is empty.
+        <Stack spacing={1.25}>
+          <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
+            <Typography variant="subtitle1" sx={{ color: '#f8fafc', fontWeight: 700 }}>
+              Final Reconciliation
+            </Typography>
+            <Chip
+              size="small"
+              label={finalReconciliation.model_name || finalReconciliation.agent_name}
+              sx={{ bgcolor: 'rgba(59,130,246,0.18)', color: '#dbeafe', border: '1px solid rgba(96,165,250,0.45)' }}
+            />
+          </Stack>
+          <Typography variant="body2" sx={{ color: '#e2e8f0' }}>
+            {finalReconciliation.overall_impression}
+          </Typography>
+          {finalReconciliation.priority_actions.length > 0 && (
+            <Stack spacing={0.5}>
+              <Typography variant="caption" sx={{ color: '#93c5fd', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                Priority Actions
               </Typography>
-            ) : (
-              entries.map((entry) => (
-                <Box key={`${entry.sequence}-${entry.created_at}`} sx={{ mb: 1 }}>
-                  <Typography component="div" sx={{ fontFamily: 'inherit', fontSize: 'inherit' }}>
-                    [{entry.sequence}] {entry.entry_kind} • {entry.agent_name || '-'}
-                  </Typography>
-                  <Typography component="div" sx={{ fontFamily: 'inherit', fontSize: 'inherit', color: '#d7dee8' }}>
-                    {entry.content}
-                  </Typography>
-                  {Object.keys(entry.payload ?? {}).length > 0 && (
-                    <Typography component="div" sx={{ fontFamily: 'inherit', fontSize: 'inherit', color: '#8f99a7' }}>
-                      payload={JSON.stringify(entry.payload)}
-                    </Typography>
-                  )}
-                </Box>
-              ))
-            )}
-          </Box>
+              {finalReconciliation.priority_actions.slice(0, 3).map((action, index) => (
+                <Typography key={`${action}-${index}`} variant="body2" sx={{ color: '#e2e8f0' }}>
+                  {index + 1}. {action}
+                </Typography>
+              ))}
+            </Stack>
+          )}
         </Stack>
       </CardContent>
     </Card>
   )
 }
 
-function CoachNoteCard({ note }: { note: CoachNote }) {
-  const [isExpanded, setIsExpanded] = useState(!note.default_collapsed)
+function AgentReasoningCard({ agent }: { agent: CoachAgentProgress }) {
+  const [showEvents, setShowEvents] = useState(false)
+  const isPending = agent.status === 'pending'
+  const isProcessing = agent.status === 'processing'
+  const isWaiting = isPending || isProcessing
+  const isCompleted = agent.status === 'completed'
+  const hasReasoningEvents = agent.reasoning_events.length > 0
+  const impression = agent.window_impression?.body?.trim() || ''
 
   return (
     <Card variant="outlined">
       <CardContent sx={{ p: 1.25, '&:last-child': { pb: 1.25 } }}>
         <Stack spacing={1}>
-          <Box
-            onClick={() => setIsExpanded((previous) => !previous)}
-            sx={{
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'space-between',
-              cursor: 'pointer',
-            }}
-          >
-            <Typography variant="subtitle2">{note.title}</Typography>
-            <Typography variant="caption" color="text.secondary">
-              {isExpanded ? 'v' : '>'}
-            </Typography>
-          </Box>
-
-          <Collapse in={isExpanded}>
-            <Stack spacing={1}>
-              <Typography variant="body2" color="text.secondary">
-                {note.body}
+          <Stack direction="row" alignItems="flex-start" justifyContent="space-between" spacing={1}>
+            <Stack spacing={0.5}>
+              <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                <Chip size="small" label={agent.model_name || 'model'} />
+                <Chip size="small" variant="outlined" label={agent.window_label} />
+              </Stack>
+              <Typography variant="caption" color="text.secondary">
+                {agent.agent_name}
               </Typography>
-              {note.evidence_refs.length > 0 && (
-                <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
-                  {note.evidence_refs.map((evidenceRef) => (
-                    <Chip key={evidenceRef} size="small" label={evidenceRef} />
-                  ))}
+            </Stack>
+            <Chip
+              size="small"
+              label={formatStatusLabel(agent.status)}
+              sx={{
+                bgcolor: `${STAGE_STATUS_COLOR[agent.status]}22`,
+                border: '1px solid',
+                borderColor: `${STAGE_STATUS_COLOR[agent.status]}66`,
+              }}
+            />
+          </Stack>
+
+          {isWaiting && (
+            <Stack spacing={0.75}>
+              <LinearProgress />
+              <Typography variant="body2" color="text.secondary">
+                {isProcessing ? 'Reasoning in progress...' : 'Queued...'}
+              </Typography>
+            </Stack>
+          )}
+
+          {isCompleted && (
+            <Stack spacing={0.75}>
+              <Typography variant="body2">{impression || 'No impression captured for this window yet.'}</Typography>
+              {hasReasoningEvents && (
+                <Stack spacing={0.5}>
+                  <Button size="small" onClick={() => setShowEvents((previous) => !previous)} sx={{ alignSelf: 'flex-start', px: 0, minWidth: 0 }}>
+                    {showEvents ? 'Hide reasoning events' : 'View reasoning events'}
+                  </Button>
+                  <Collapse in={showEvents}>
+                    <Stack spacing={0.75}>
+                      {agent.reasoning_events.map((event) => (
+                        <Box key={event.note_id} sx={{ p: 1, borderRadius: 1, bgcolor: 'grey.50', border: '1px solid', borderColor: 'divider' }}>
+                          <Typography variant="caption" color="text.secondary">
+                            {event.title}
+                          </Typography>
+                          <Typography variant="body2">{event.body}</Typography>
+                          {event.evidence_refs.length > 0 && (
+                            <Stack direction="row" spacing={0.5} useFlexGap flexWrap="wrap" sx={{ mt: 0.5 }}>
+                              {event.evidence_refs.map((evidenceRef) => (
+                                <Chip key={`${event.note_id}-${evidenceRef}`} size="small" label={evidenceRef} />
+                              ))}
+                            </Stack>
+                          )}
+                        </Box>
+                      ))}
+                    </Stack>
+                  </Collapse>
                 </Stack>
               )}
             </Stack>
-          </Collapse>
+          )}
+
+          {agent.status === 'failed' && (
+            <Alert severity="warning" sx={{ py: 0 }}>
+              This window failed before an impression was generated.
+            </Alert>
+          )}
         </Stack>
       </CardContent>
     </Card>
@@ -200,8 +361,6 @@ function CoachNoteCard({ note }: { note: CoachNote }) {
 function CoachPanelContent({
   session,
   coachProgress,
-  liveNotes,
-  isLive,
   onRetry,
   isRetrying,
   retryError,
@@ -209,18 +368,19 @@ function CoachPanelContent({
 }: {
   session: CoachingSessionDetail
   coachProgress: CoachProgress | null
-  liveNotes: string[]
-  isLive: boolean
   onRetry: () => void
   isRetrying: boolean
   retryError: string | null
   showReadyTransition: boolean
 }) {
-  const ledgerEntries = coachProgress?.ledger_entries ?? []
+  const finalReconciliation = coachProgress?.final_reconciliation ?? null
+  const orderedSubagents = sortAgentProgressChronologically(
+    (coachProgress?.agent_progress ?? []).filter((agent) => agent.agent_kind === 'subagent'),
+  )
 
-  if (session.status === 'ready') {
-    return (
-      <Stack spacing={2}>
+  return (
+    <Stack spacing={1.5}>
+      {session.status === 'ready' && (
         <Fade in={showReadyTransition} timeout={600}>
           <Stack
             direction="row"
@@ -241,82 +401,7 @@ function CoachPanelContent({
             </Typography>
           </Stack>
         </Fade>
-
-        <Typography variant="h6">Coach Review</Typography>
-        {!coachProgress ? (
-          <Stack spacing={1.25}>
-            <Alert severity="info">Coach review sections are unavailable until coach_progress is added to the backend response.</Alert>
-            <FinalLedgerPanel entries={ledgerEntries} />
-          </Stack>
-        ) : (
-          <Stack spacing={1.25}>
-            {coachProgress.stages.length === 0 && (
-              <Typography variant="body2" color="text.secondary">
-                No coach stages yet.
-              </Typography>
-            )}
-            {coachProgress.stages.map((stage) => (
-              <Card key={stage.stage_key} variant="outlined">
-                <CardContent sx={{ p: 1.5, '&:last-child': { pb: 1.5 } }}>
-                  <Stack spacing={1.25}>
-                    <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
-                      <Stack direction="row" alignItems="center" spacing={0.75}>
-                        <Box
-                          sx={{
-                            width: 8,
-                            height: 8,
-                            borderRadius: '50%',
-                            bgcolor: STAGE_STATUS_COLOR[stage.status],
-                          }}
-                        />
-                        <Typography variant="subtitle2">{stage.label}</Typography>
-                      </Stack>
-                      <Typography variant="caption" color="text.secondary" sx={{ textAlign: 'right' }}>
-                        {formatStatusLabel(stage.status)}
-                      </Typography>
-                    </Stack>
-
-                    {stage.notes.length > 0 ? (
-                      <Stack spacing={1}>
-                        {stage.notes.map((note) => (
-                          <CoachNoteCard key={note.note_id} note={note} />
-                        ))}
-                      </Stack>
-                    ) : (
-                      <Typography variant="body2" color="text.secondary">
-                        No notes yet.
-                      </Typography>
-                    )}
-                  </Stack>
-                </CardContent>
-              </Card>
-            ))}
-            <FinalLedgerPanel entries={ledgerEntries} />
-          </Stack>
-        )}
-      </Stack>
-    )
-  }
-
-  return (
-    <Stack spacing={1.5}>
-      <Stack direction="row" alignItems="center" spacing={1}>
-        <Box
-          sx={{
-            width: 8,
-            height: 8,
-            borderRadius: '50%',
-            bgcolor: 'info.main',
-            animation: 'pulse 1.4s ease-in-out infinite',
-            '@keyframes pulse': {
-              '0%': { opacity: 0.25, transform: 'scale(0.9)' },
-              '50%': { opacity: 1, transform: 'scale(1.05)' },
-              '100%': { opacity: 0.25, transform: 'scale(0.9)' },
-            },
-          }}
-        />
-        <Typography variant="subtitle1">Gemini is taking notes...</Typography>
-      </Stack>
+      )}
 
       {session.status === 'coach_failed' && (
         <Alert
@@ -333,52 +418,40 @@ function CoachPanelContent({
 
       {retryError && <Alert severity="error">{retryError}</Alert>}
 
-      <Box
-        sx={{
-          borderRadius: 1.5,
-          border: '1px solid',
-          borderColor: 'grey.800',
-          bgcolor: '#101317',
-          color: '#b7c0cb',
-          minHeight: 260,
-          maxHeight: 380,
-          overflowY: 'auto',
-          px: 1.5,
-          py: 1.25,
-          fontFamily: '"IBM Plex Mono", "Fira Code", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
-          fontSize: 13,
-          lineHeight: 1.55,
-        }}
-      >
-        {liveNotes.length === 0 ? (
-          <Typography component="div" sx={{ color: '#8f99a7', fontFamily: 'inherit', fontSize: 'inherit' }}>
-            Waiting for live notes...
-          </Typography>
-        ) : (
-          liveNotes.map((line, index) => (
-            <Typography key={`${line}-${index}`} component="div" sx={{ fontFamily: 'inherit', fontSize: 'inherit', color: '#b7c0cb' }}>
-              {line}
-            </Typography>
-          ))
-        )}
+      {!coachProgress ? (
+        <Alert severity="info">Coach progress is not available yet.</Alert>
+      ) : (
+        <Stack spacing={1.25}>
+          {finalReconciliation && <ReconciliationHero finalReconciliation={finalReconciliation} />}
 
-        <Box component="span" sx={{ display: 'inline-flex', ml: 0.5, verticalAlign: 'middle' }}>
-          <Box
-            component="span"
-            sx={{
-              width: 8,
-              height: 16,
-              bgcolor: '#c6ced8',
-              opacity: isLive ? 1 : 0.4,
-              animation: isLive ? 'cursorBlink 1s steps(1, end) infinite' : 'none',
-              '@keyframes cursorBlink': {
-                '0%, 49%': { opacity: 1 },
-                '50%, 100%': { opacity: 0 },
-              },
-            }}
-          />
-        </Box>
-      </Box>
+          <Stack spacing={0.5}>
+            <Typography variant="h6">Reasoning Timeline</Typography>
+            <Typography variant="body2" color="text.secondary">
+              Windows are always rendered in chronological order.
+            </Typography>
+          </Stack>
+
+          {orderedSubagents.length === 0 ? (
+            <Typography variant="body2" color="text.secondary">
+              Waiting for subagent windows...
+            </Typography>
+          ) : (
+            <Box
+              sx={{
+                maxHeight: 420,
+                overflowY: 'auto',
+                pr: 0.5,
+              }}
+            >
+              <Stack spacing={1}>
+                {orderedSubagents.map((agent) => (
+                  <AgentReasoningCard key={agent.agent_execution_id} agent={agent} />
+                ))}
+              </Stack>
+            </Box>
+          )}
+        </Stack>
+      )}
     </Stack>
   )
 }
@@ -621,7 +694,7 @@ function ChatPanel({ sessionId, sessionStatus }: { sessionId: string; sessionSta
           multiline
           maxRows={4}
           value={draftMessage}
-          onChange={(event) => setDraftMessage(event.target.value)}
+          onChange={(event: React.ChangeEvent<HTMLInputElement>) => setDraftMessage(event.target.value)}
           disabled={isLocked || isSending}
           fullWidth
         />
@@ -715,9 +788,10 @@ function AnnotationTimeline({
     )
   }
 
-  const audioTrack = annotations.filter((annotation) => annotation.source === 'audio')
-  const videoTrack = annotations.filter((annotation) => annotation.source === 'video')
-  const maxEndMs = Math.max(1, ...annotations.map((annotation) => annotation.end_ms))
+  const maxEndMs = Math.max(
+    1,
+    ...annotations.map((annotation) => Math.max(annotation.start_ms, annotation.end_ms))
+  )
 
   return (
     <Card variant="outlined">
@@ -725,6 +799,9 @@ function AnnotationTimeline({
         <Stack spacing={2}>
           <Typography variant="h6">Annotation Timeline</Typography>
           <Stack direction="row" spacing={1.5} alignItems="center">
+            <Typography variant="caption" color="text.secondary">
+              Confidence
+            </Typography>
             {(['high', 'medium', 'low'] as const).map((level) => (
               <Stack direction="row" spacing={0.5} alignItems="center" key={level}>
                 <Box
@@ -732,7 +809,7 @@ function AnnotationTimeline({
                     width: 10,
                     height: 10,
                     borderRadius: '2px',
-                    bgcolor: SEVERITY_COLOR[level],
+                    bgcolor: CONFIDENCE_COLOR[level],
                   }}
                 />
                 <Typography variant="caption" color="text.secondary">
@@ -748,34 +825,18 @@ function AnnotationTimeline({
               No annotations available yet.
             </Typography>
           ) : (
-            <Stack spacing={2}>
-              <TimelineTrack
-                label="Audio"
-                color="info.main"
-                annotations={audioTrack}
-                maxEndMs={maxEndMs}
-                totalDurationMs={maxEndMs}
-                currentMs={currentMs}
-                onSeek={(ms) => {
-                  if (videoRef.current) {
-                    videoRef.current.currentTime = ms / 1000
-                  }
-                }}
-              />
-              <TimelineTrack
-                label="Video"
-                color="secondary.main"
-                annotations={videoTrack}
-                maxEndMs={maxEndMs}
-                totalDurationMs={maxEndMs}
-                currentMs={currentMs}
-                onSeek={(ms) => {
-                  if (videoRef.current) {
-                    videoRef.current.currentTime = ms / 1000
-                  }
-                }}
-              />
-            </Stack>
+            <TimelineTrack
+              label="Events"
+              annotations={annotations}
+              maxEndMs={maxEndMs}
+              totalDurationMs={maxEndMs}
+              currentMs={currentMs}
+              onSeek={(ms) => {
+                if (videoRef.current) {
+                  videoRef.current.currentTime = ms / 1000
+                }
+              }}
+            />
           )}
         </Stack>
       </CardContent>
@@ -785,7 +846,6 @@ function AnnotationTimeline({
 
 function TimelineTrack({
   label,
-  color,
   annotations,
   maxEndMs,
   totalDurationMs,
@@ -793,13 +853,18 @@ function TimelineTrack({
   onSeek,
 }: {
   label: string
-  color: string
   annotations: Annotation[]
   maxEndMs: number
   totalDurationMs: number
   currentMs: number
   onSeek: (ms: number) => void
 }) {
+  const stackedAnnotations = buildStackedTimelineAnnotations(annotations)
+  const laneCount = Math.max(1, ...stackedAnnotations.map((item) => item.laneIndex + 1))
+  const trackHeight =
+    TIMELINE_VERTICAL_PADDING * 2 +
+    laneCount * TIMELINE_LANE_HEIGHT +
+    Math.max(0, laneCount - 1) * TIMELINE_LANE_GAP
   const playheadPosition = Math.min(100, Math.max(0, (currentMs / totalDurationMs) * 100))
 
   return (
@@ -814,7 +879,7 @@ function TimelineTrack({
       <Box
         sx={{
           position: 'relative',
-          height: 44,
+          height: trackHeight,
           borderRadius: 1.5,
           border: '1px solid',
           borderColor: 'divider',
@@ -822,7 +887,6 @@ function TimelineTrack({
           overflow: 'hidden',
         }}
       >
-        <Divider sx={{ position: 'absolute', insetX: 0, top: '50%' }} />
         <Box
           sx={{
             position: 'absolute',
@@ -835,32 +899,96 @@ function TimelineTrack({
             zIndex: 2,
           }}
         />
-        {annotations.map((annotation) => {
-          const left = Math.min(100, Math.max(0, (annotation.start_ms / totalDurationMs) * 100))
-          const durationWidth = Math.max(0.8, ((annotation.end_ms - annotation.start_ms) / totalDurationMs) * 100)
-          const severityColor = SEVERITY_COLOR[annotation.severity]
+        {stackedAnnotations.map((stackedAnnotation) => {
+          const { annotation, confidenceLevel, laneIndex, resolvedConfidence } = stackedAnnotation
+          const startMs = Math.max(0, annotation.start_ms)
+          const endMs = Math.max(startMs, annotation.end_ms)
+          const left = Math.min(100, Math.max(0, (startMs / totalDurationMs) * 100))
+          const durationWidth = Math.max(0.8, ((endMs - startMs) / totalDurationMs) * 100)
+          const confidenceColor = CONFIDENCE_COLOR[confidenceLevel]
+          const confidenceLabel = formatStatusLabel(confidenceLevel)
+          const severity = resolveAnnotationSeverity(annotation)
+          const severityLabel = severity ? formatStatusLabel(severity) : null
+          const top =
+            TIMELINE_VERTICAL_PADDING +
+            laneIndex * (TIMELINE_LANE_HEIGHT + TIMELINE_LANE_GAP) +
+            (TIMELINE_LANE_HEIGHT - TIMELINE_BAR_HEIGHT) / 2
 
           return (
             <Tooltip
               key={annotation.id}
-              title={`${formatTimestamp(annotation.start_ms)} • ${annotation.summary}`}
+              title={
+                <Stack spacing={0.25}>
+                  <Typography variant="caption" sx={{ color: 'inherit', fontWeight: 600 }}>
+                    {formatTimestamp(startMs)} - {formatTimestamp(endMs)}
+                  </Typography>
+                  <Typography variant="caption" sx={{ color: 'inherit' }}>
+                    {annotation.summary}
+                  </Typography>
+                  <Typography variant="caption" sx={{ color: 'inherit' }}>
+                    Source: {annotation.source}
+                    {severityLabel ? ` • Severity: ${severityLabel}` : ''}
+                    {' • '}Confidence: {confidenceLabel} ({formatConfidencePercent(resolvedConfidence)})
+                  </Typography>
+                </Stack>
+              }
               placement="top"
               arrow
             >
               <Box
-                onClick={() => onSeek(annotation.start_ms)}
+                onClick={() => onSeek(startMs)}
                 sx={{
                   position: 'absolute',
                   left: `${left}%`,
-                  top: '50%',
-                  transform: 'translateY(-50%)',
+                  top,
                   width: `${durationWidth}%`,
-                  height: 14,
+                  height: TIMELINE_BAR_HEIGHT,
                   borderRadius: '3px',
-                  bgcolor: severityColor ?? color,
+                  bgcolor: confidenceColor,
+                  display: 'flex',
+                  alignItems: 'center',
+                  px: 0.5,
+                  overflow: 'hidden',
                   cursor: 'pointer',
                 }}
-              />
+              >
+                <Box
+                  sx={{
+                    px: 0.5,
+                    borderRadius: '999px',
+                    bgcolor: CONFIDENCE_BADGE_BG[confidenceLevel],
+                    color: confidenceColor,
+                    border: '1px solid',
+                    borderColor: confidenceColor,
+                    fontSize: 9,
+                    fontWeight: 700,
+                    lineHeight: 1.3,
+                    textTransform: 'uppercase',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    maxWidth: '100%',
+                  }}
+                >
+                  <Typography
+                    component="span"
+                    variant="caption"
+                    sx={{
+                      display: 'block',
+                      color: 'inherit',
+                      fontSize: 'inherit',
+                      fontWeight: 'inherit',
+                      lineHeight: 'inherit',
+                      textTransform: 'inherit',
+                      whiteSpace: 'inherit',
+                      overflow: 'inherit',
+                      textOverflow: 'inherit',
+                    }}
+                  >
+                    {confidenceLabel}
+                  </Typography>
+                </Box>
+              </Box>
             </Tooltip>
           )
         })}
@@ -877,8 +1005,6 @@ function DashboardPage() {
 
   const [session, setSession] = useState<CoachingSessionDetail | null>(null)
   const [annotations, setAnnotations] = useState<Annotation[]>([])
-  const [liveNoteSource, setLiveNoteSource] = useState<string[]>([])
-  const [displayedLiveNotes, setDisplayedLiveNotes] = useState<string[]>([])
 
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -892,68 +1018,6 @@ function DashboardPage() {
   const [leftPanelTab, setLeftPanelTab] = useState<LeftPanelTab>('coach')
   const [showReadyTransition, setShowReadyTransition] = useState(false)
   const previousStatus = useRef<SessionStatus | null>(null)
-
-  useEffect(() => {
-    if (!id) {
-      return
-    }
-
-    let isMounted = true
-
-    const loadLiveNotes = async () => {
-      try {
-        const notes = await api.sessions.getLiveNotes(id)
-        if (isMounted) {
-          setLiveNoteSource(notes)
-        }
-      } catch {
-        if (isMounted) {
-          setLiveNoteSource([])
-        }
-      }
-    }
-
-    void loadLiveNotes()
-
-    return () => {
-      isMounted = false
-    }
-  }, [id])
-
-  useEffect(() => {
-    setDisplayedLiveNotes([])
-  }, [id])
-
-  useEffect(() => {
-    if (!session) {
-      return
-    }
-
-    if (session.status === 'ready') {
-      setDisplayedLiveNotes([])
-      return
-    }
-
-    if (!shouldShowLiveNotes(session.status)) {
-      return
-    }
-
-    const source = liveNoteSource.length > 0 ? liveNoteSource : FALLBACK_LIVE_NOTES
-
-    const intervalId = setInterval(() => {
-      setDisplayedLiveNotes((previous) => {
-        if (previous.length >= source.length) {
-          return previous
-        }
-
-        return [...previous, source[previous.length]]
-      })
-    }, 800)
-
-    return () => {
-      clearInterval(intervalId)
-    }
-  }, [liveNoteSource, session])
 
   useEffect(() => {
     if (!session) {
@@ -1102,8 +1166,6 @@ function DashboardPage() {
     }
   }
 
-  const currentLiveNotes = displayedLiveNotes.length > 0 ? displayedLiveNotes : []
-
   return (
     <Container maxWidth="xl" sx={{ py: 3 }}>
       <Stack spacing={2.5}>
@@ -1142,8 +1204,8 @@ function DashboardPage() {
               gap: 2,
               gridTemplateColumns: { xs: '1fr', lg: '380px 1fr' },
               gridTemplateAreas: {
-                xs: '"left" "video" "timeline"',
-                lg: '"left video" "timeline timeline"',
+                xs: '"left" "video"',
+                lg: '"left video"',
               },
             }}
           >
@@ -1153,7 +1215,7 @@ function DashboardPage() {
                   <Stack spacing={1.5}>
                     <Tabs
                       value={leftPanelTab}
-                      onChange={(_, nextTab: LeftPanelTab) => setLeftPanelTab(nextTab)}
+                      onChange={(_event: React.SyntheticEvent, nextTab: LeftPanelTab) => setLeftPanelTab(nextTab)}
                       variant="fullWidth"
                       sx={{ minHeight: 40 }}
                     >
@@ -1165,8 +1227,6 @@ function DashboardPage() {
                       <CoachPanelContent
                         session={session}
                         coachProgress={session.coach_progress}
-                        liveNotes={currentLiveNotes}
-                        isLive={shouldShowLiveNotes(session.status)}
                         onRetry={handleRetryCoach}
                         isRetrying={isRetryingCoach}
                         retryError={retryError}
@@ -1181,25 +1241,24 @@ function DashboardPage() {
             </Box>
 
             <Box sx={{ gridArea: 'video' }}>
-              <VideoPlayer
-                videoUrl={session.video_file_url}
-                videoRef={videoRef}
-                onTimeUpdate={() => {
-                  if (videoRef.current) {
-                    setCurrentMs(videoRef.current.currentTime * 1000)
-                  }
-                }}
-              />
-            </Box>
-
-            <Box sx={{ gridArea: 'timeline' }}>
-              <AnnotationTimeline
-                status={session.status}
-                annotations={annotations}
-                timelineError={timelineError}
-                videoRef={videoRef}
-                currentMs={currentMs}
-              />
+              <Stack spacing={2}>
+                <VideoPlayer
+                  videoUrl={session.video_file_url}
+                  videoRef={videoRef}
+                  onTimeUpdate={() => {
+                    if (videoRef.current) {
+                      setCurrentMs(videoRef.current.currentTime * 1000)
+                    }
+                  }}
+                />
+                <AnnotationTimeline
+                  status={session.status}
+                  annotations={annotations}
+                  timelineError={timelineError}
+                  videoRef={videoRef}
+                  currentMs={currentMs}
+                />
+              </Stack>
             </Box>
           </Box>
         )}

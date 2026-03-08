@@ -10,7 +10,7 @@ from django.db.models import Q
 from django.utils import timezone
 from django.utils.deconstruct import deconstructible
 
-MAX_VIDEO_FILE_SIZE_BYTES = 500 * 1024 * 1024
+MAX_VIDEO_FILE_SIZE_BYTES = 50 * 1024 * 1024
 MAX_SUPPLEMENTARY_PDF_FILE_SIZE_BYTES = 25 * 1024 * 1024
 
 

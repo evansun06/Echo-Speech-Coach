@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
+from django.conf import settings
 from rest_framework import serializers
 
 from llm.live_ledger import get_live_ledger_latest_sequence, read_live_ledger_slice
@@ -14,6 +15,13 @@ from .models import (
     CoachingSession,
     SessionStatus,
 )
+
+DEFAULT_SUBAGENT_MODEL_NAME = "gemini-2.5-flash"
+DEFAULT_PRIMARY_MODEL_NAME = "gemini-2.5-flash"
+WINDOW_IMPRESSION_KIND = "window_impression"
+EVENT_NOTE_KIND = "event_note"
+GENERAL_NOTE_KIND = "general"
+MISSING_WINDOW_LABEL = "No fixed window"
 
 
 def _absolute_file_url(request, file_field) -> str | None:
@@ -84,6 +92,162 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _safe_str(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def _format_mmss_from_ms(value_ms: int) -> str:
+    total_seconds = max(int(value_ms), 0) // 1000
+    minutes = total_seconds // 60
+    seconds = total_seconds % 60
+    return f"{minutes}:{seconds:02d}"
+
+
+def _format_window_label(*, window_start_ms: int | None, window_end_ms: int | None) -> str:
+    if window_start_ms is None or window_end_ms is None:
+        return MISSING_WINDOW_LABEL
+    return (
+        f"{_format_mmss_from_ms(window_start_ms)} - "
+        f"{_format_mmss_from_ms(window_end_ms)}"
+    )
+
+
+def _fallback_model_name_for_agent_kind(agent_kind: str | None) -> str:
+    if agent_kind == "subagent":
+        return str(
+            getattr(
+                settings,
+                "GEMINI_SUBAGENT_MODEL",
+                DEFAULT_SUBAGENT_MODEL_NAME,
+            )
+        ).strip()
+    if agent_kind in {"flagship_periodic", "flagship_final"}:
+        return str(
+            getattr(
+                settings,
+                "GEMINI_PRIMARY_MODEL",
+                DEFAULT_PRIMARY_MODEL_NAME,
+            )
+        ).strip()
+    return ""
+
+
+def _note_kind_from_payload(*, payload: dict[str, Any], note_title: str) -> str:
+    note_type = _safe_str(payload.get("note_type")).lower()
+    if note_type == WINDOW_IMPRESSION_KIND:
+        return WINDOW_IMPRESSION_KIND
+    if note_type == EVENT_NOTE_KIND:
+        return EVENT_NOTE_KIND
+    if note_title.strip().lower() == "window impression":
+        return WINDOW_IMPRESSION_KIND
+    return GENERAL_NOTE_KIND
+
+
+def _build_serialized_note(
+    *,
+    note_id: str,
+    title: str,
+    body: str,
+    payload: dict[str, Any],
+    sequence: int | None,
+) -> dict[str, Any]:
+    note_kind = _note_kind_from_payload(payload=payload, note_title=title)
+    event_id = _safe_str(payload.get("event_id"))
+    event_type = _safe_str(payload.get("event_type"))
+    return {
+        "note_id": note_id,
+        "title": title,
+        "body": body,
+        "evidence_refs": _extract_evidence_refs(payload),
+        "default_collapsed": True,
+        "note_kind": note_kind,
+        "event_id": event_id or None,
+        "event_type": event_type or None,
+        "sequence": sequence,
+    }
+
+
+def _split_execution_notes(
+    notes: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    window_impression: dict[str, Any] | None = None
+    reasoning_events: list[dict[str, Any]] = []
+    for note in notes:
+        note_kind = _safe_str(note.get("note_kind"))
+        if note_kind == WINDOW_IMPRESSION_KIND:
+            if window_impression is None:
+                window_impression = note
+            continue
+        if note_kind == EVENT_NOTE_KIND:
+            reasoning_events.append(note)
+    return window_impression, reasoning_events
+
+
+def _resolve_execution_model_name(
+    *,
+    agent_kind: str | None,
+    model_name_by_execution_id: dict[str, str],
+    execution_id: str,
+) -> str:
+    model_name = model_name_by_execution_id.get(execution_id, "").strip()
+    if model_name:
+        return model_name
+    return _fallback_model_name_for_agent_kind(agent_kind)
+
+
+def _execution_sort_key(execution) -> tuple[int, int, int, int, int, Any]:
+    start_is_null = 1 if execution.window_start_ms is None else 0
+    end_is_null = 1 if execution.window_end_ms is None else 0
+    return (
+        start_is_null,
+        execution.window_start_ms if execution.window_start_ms is not None else 0,
+        end_is_null,
+        execution.window_end_ms if execution.window_end_ms is not None else 0,
+        execution.execution_index,
+        execution.created_at,
+    )
+
+
+def _build_final_reconciliation(
+    *,
+    serialized_ledger_entries: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    for entry in reversed(serialized_ledger_entries):
+        if str(entry.get("entry_kind", "")) != "flagship_final":
+            continue
+        payload = entry.get("payload")
+        normalized_payload = payload if isinstance(payload, dict) else {}
+        model_name = _safe_str(normalized_payload.get("model_name"))
+        return {
+            "agent_name": str(entry.get("agent_name", "")).strip(),
+            "model_name": (
+                model_name
+                or _fallback_model_name_for_agent_kind("flagship_final")
+            ),
+            "overall_impression": (
+                _safe_str(normalized_payload.get("overall_impression"))
+                or str(entry.get("content", "")).strip()
+            ),
+            "strengths": _normalize_string_list(normalized_payload.get("strengths")),
+            "improvements": _normalize_string_list(
+                normalized_payload.get("improvements")
+            ),
+            "priority_actions": _normalize_string_list(
+                normalized_payload.get("priority_actions")
+            ),
+            "created_at": str(entry.get("created_at", "")),
+        }
+    return None
 
 
 def _serialize_live_ledger_entry(entry: dict[str, Any]) -> dict[str, Any]:
@@ -268,27 +432,18 @@ class SessionDetailSerializer(serializers.ModelSerializer):
                 "agent_progress": [],
                 "stages": [],
                 "ledger_entries": [],
+                "final_reconciliation": None,
             }
 
-        executions = list(
-            run.agent_executions.order_by("execution_index", "created_at")
-        )
+        executions = list(run.agent_executions.all())
         ledger_entries = list(run.ledger_entries.order_by("sequence", "created_at"))
         live_entries, live_latest_sequence = _read_live_ledger_entries(run)
         use_live_entries = bool(live_entries)
+        executions = sorted(executions, key=_execution_sort_key)
         if use_live_entries:
             live_entries = sorted(
                 live_entries,
                 key=lambda item: _safe_int(item.get("sequence", 0)),
-            )
-            executions = sorted(
-                executions,
-                key=lambda item: (
-                    item.window_start_ms is None,
-                    item.window_start_ms or 0,
-                    item.execution_index,
-                    item.created_at,
-                ),
             )
 
         if use_live_entries:
@@ -304,6 +459,7 @@ class SessionDetailSerializer(serializers.ModelSerializer):
             ]
 
         notes_by_execution_id: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        model_name_by_execution_id: dict[str, str] = {}
         if use_live_entries:
             for entry in live_entries:
                 payload = entry.get("payload")
@@ -314,16 +470,20 @@ class SessionDetailSerializer(serializers.ModelSerializer):
                     if isinstance(title, str) and title
                     else str(entry.get("entry_kind", "Note"))
                 )
-                note_payload = {
-                    "note_id": f"live-{entry.get('sequence', '')}",
-                    "title": note_title,
-                    "body": str(entry.get("content", "")),
-                    "evidence_refs": _extract_evidence_refs(normalized_payload),
-                    "default_collapsed": True,
-                }
+                sequence = _safe_int(entry.get("sequence", 0), 0)
+                model_name = _safe_str(normalized_payload.get("model_name"))
+                note_payload = _build_serialized_note(
+                    note_id=f"live-{entry.get('sequence', '')}",
+                    title=note_title,
+                    body=str(entry.get("content", "")),
+                    payload=normalized_payload,
+                    sequence=sequence if sequence > 0 else None,
+                )
                 execution_id = entry.get("agent_execution_id")
                 if not isinstance(execution_id, str) or not execution_id:
                     continue
+                if model_name and execution_id not in model_name_by_execution_id:
+                    model_name_by_execution_id[execution_id] = model_name
                 notes_by_execution_id[execution_id].append(note_payload)
         else:
             for entry in ledger_entries:
@@ -332,16 +492,20 @@ class SessionDetailSerializer(serializers.ModelSerializer):
                 note_title = (
                     title if isinstance(title, str) and title else entry.get_entry_kind_display()
                 )
-                note_payload = {
-                    "note_id": str(entry.id),
-                    "title": note_title,
-                    "body": entry.content,
-                    "evidence_refs": _extract_evidence_refs(payload),
-                    "default_collapsed": True,
-                }
+                model_name = _safe_str(payload.get("model_name"))
+                note_payload = _build_serialized_note(
+                    note_id=str(entry.id),
+                    title=note_title,
+                    body=entry.content,
+                    payload=payload,
+                    sequence=int(entry.sequence),
+                )
                 if entry.agent_execution_id is None:
                     continue
-                notes_by_execution_id[str(entry.agent_execution_id)].append(note_payload)
+                execution_id = str(entry.agent_execution_id)
+                if model_name and execution_id not in model_name_by_execution_id:
+                    model_name_by_execution_id[execution_id] = model_name
+                notes_by_execution_id[execution_id].append(note_payload)
 
         agent_progress = []
         stages = []
@@ -350,10 +514,16 @@ class SessionDetailSerializer(serializers.ModelSerializer):
             ui_status = _agent_ui_status(execution.status)
             completed_at = execution.finished_at or execution.failed_at
             stage_notes = notes_by_execution_id.get(str(execution.id), [])
+            window_impression, reasoning_events = _split_execution_notes(stage_notes)
             label = execution.agent_name or execution.get_agent_kind_display()
             stage_key = f"agent-{execution.execution_index}"
+            model_name = _resolve_execution_model_name(
+                agent_kind=execution.agent_kind,
+                model_name_by_execution_id=model_name_by_execution_id,
+                execution_id=str(execution.id),
+            )
 
-            if ui_status == "processing":
+            if ui_status == "processing" and not current_stage:
                 current_stage = stage_key
 
             agent_progress.append(
@@ -371,6 +541,13 @@ class SessionDetailSerializer(serializers.ModelSerializer):
                     "started_at": _iso_or_none(execution.started_at),
                     "completed_at": _iso_or_none(completed_at),
                     "last_heartbeat_at": _iso_or_none(execution.last_heartbeat_at),
+                    "model_name": model_name,
+                    "window_label": _format_window_label(
+                        window_start_ms=execution.window_start_ms,
+                        window_end_ms=execution.window_end_ms,
+                    ),
+                    "window_impression": window_impression,
+                    "reasoning_events": reasoning_events,
                 }
             )
             stages.append(
@@ -390,6 +567,9 @@ class SessionDetailSerializer(serializers.ModelSerializer):
             if use_live_entries
             else run.latest_ledger_sequence
         )
+        final_reconciliation = _build_final_reconciliation(
+            serialized_ledger_entries=serialized_ledger_entries
+        )
 
         return {
             "status": _coach_progress_status_from_run(run.status),
@@ -401,4 +581,5 @@ class SessionDetailSerializer(serializers.ModelSerializer):
             "agent_progress": agent_progress,
             "stages": stages,
             "ledger_entries": serialized_ledger_entries,
+            "final_reconciliation": final_reconciliation,
         }

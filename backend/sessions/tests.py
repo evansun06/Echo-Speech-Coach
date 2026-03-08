@@ -1304,6 +1304,7 @@ class SessionMlWorkflowTaskTests(TestCase):
     @patch("ml.tasks.enqueue_full_coach_workflow_job")
     @patch("ml.tasks.persist_canonical_payload")
     @patch("ml.tasks.run_pipeline")
+    @override_settings(ML_ALLOW_SAMPLE_FALLBACK=True)
     def test_run_session_ml_workflow_task_falls_back_to_sample_media_when_session_media_is_unavailable(
         self,
         run_pipeline_mock,
@@ -1334,6 +1335,20 @@ class SessionMlWorkflowTaskTests(TestCase):
         self.assertEqual(result["ml_media_source"], "sample_fallback")
         self.assertTrue(run_pipeline_mock.call_args.kwargs["audio_path"].endswith("/ml/evan_test.wav"))
         self.assertTrue(run_pipeline_mock.call_args.kwargs["video_path"].endswith("/ml/evan_test.mp4"))
+
+    @patch("ml.tasks.run_pipeline")
+    @override_settings(ML_ALLOW_SAMPLE_FALLBACK=False)
+    def test_run_session_ml_workflow_task_fails_when_session_media_is_unavailable_without_sample_fallback(
+        self,
+        run_pipeline_mock,
+    ):
+        with self.assertRaises(RuntimeError) as error:
+            run_session_ml_workflow_task(session_id=str(self.session.id))
+
+        self.assertIn("Session media is unavailable for ML analysis", str(error.exception))
+        run_pipeline_mock.assert_not_called()
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.status, SessionStatus.FAILED)
 
     @patch("ml.tasks.run_pipeline")
     @patch("ml.tasks._resolve_ml_media_inputs")
@@ -1532,6 +1547,7 @@ class CoachingSessionApiTests(TestCase):
         self.assertEqual(response.data["coach_progress"]["stages"], [])
         self.assertEqual(response.data["coach_progress"]["latest_ledger_sequence"], 0)
         self.assertEqual(response.data["coach_progress"]["ledger_entries"], [])
+        self.assertIsNone(response.data["coach_progress"]["final_reconciliation"])
 
     def test_get_session_returns_404_for_non_owner(self):
         session = CoachingSession.objects.create(user=self.other_user)
@@ -1636,11 +1652,22 @@ class CoachingSessionApiTests(TestCase):
             str(first_execution.id),
         )
         self.assertEqual(coach_progress["agent_progress"][0]["status"], "pending")
+        self.assertEqual(coach_progress["agent_progress"][0]["window_label"], "0:00 - 0:30")
+        self.assertIsNone(coach_progress["agent_progress"][0]["window_impression"])
+        self.assertEqual(coach_progress["agent_progress"][0]["reasoning_events"], [])
+        self.assertTrue(coach_progress["agent_progress"][0]["model_name"])
         self.assertEqual(
             coach_progress["agent_progress"][1]["agent_execution_id"],
             str(second_execution.id),
         )
         self.assertEqual(coach_progress["agent_progress"][1]["status"], "completed")
+        self.assertEqual(
+            coach_progress["agent_progress"][1]["window_label"],
+            "No fixed window",
+        )
+        self.assertIsNone(coach_progress["agent_progress"][1]["window_impression"])
+        self.assertEqual(coach_progress["agent_progress"][1]["reasoning_events"], [])
+        self.assertTrue(coach_progress["agent_progress"][1]["model_name"])
         self.assertEqual(len(coach_progress["stages"]), 2)
         self.assertEqual(coach_progress["stages"][0]["stage_key"], "agent-1")
         self.assertEqual(coach_progress["stages"][1]["stage_key"], "agent-2")
@@ -1659,6 +1686,7 @@ class CoachingSessionApiTests(TestCase):
             coach_progress["ledger_entries"][0]["content"],
             "Confidence improved over the final minute.",
         )
+        self.assertIsNone(coach_progress["final_reconciliation"])
 
     @patch("sessions.serializers.get_live_ledger_latest_sequence")
     @patch("sessions.serializers.read_live_ledger_slice")
@@ -1720,6 +1748,10 @@ class CoachingSessionApiTests(TestCase):
         self.assertEqual(len(coach_progress["stages"]), 1)
         self.assertEqual(coach_progress["stages"][0]["notes"][0]["title"], "Window impression")
         self.assertEqual(
+            coach_progress["stages"][0]["notes"][0]["note_kind"],
+            "window_impression",
+        )
+        self.assertEqual(
             coach_progress["stages"][0]["notes"][0]["evidence_refs"],
             ["00:10-00:25"],
         )
@@ -1729,6 +1761,75 @@ class CoachingSessionApiTests(TestCase):
             "Pacing improved in the second half.",
         )
         self.assertEqual(coach_progress["ledger_entries"][0]["sequence"], 4)
+        self.assertEqual(len(coach_progress["agent_progress"]), 1)
+        self.assertEqual(coach_progress["agent_progress"][0]["window_label"], "0:00 - 0:30")
+        self.assertEqual(
+            coach_progress["agent_progress"][0]["window_impression"]["title"],
+            "Window impression",
+        )
+        self.assertEqual(coach_progress["agent_progress"][0]["reasoning_events"], [])
+        self.assertTrue(coach_progress["agent_progress"][0]["model_name"])
+        self.assertIsNone(coach_progress["final_reconciliation"])
+
+    def test_get_session_includes_final_reconciliation_payload(self):
+        session = CoachingSession.objects.create(
+            user=self.user,
+            title="Final Reconciliation Session",
+            status=SessionStatus.READY,
+            video_file="sessions/videos/2026/03/08/demo.mp4",
+        )
+        run = CoachOrchestrationRun.objects.create(
+            session=session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.COMPLETED,
+            latest_ledger_sequence=1,
+            started_at=timezone.now(),
+            completed_at=timezone.now(),
+        )
+        execution = CoachAgentExecution.objects.create(
+            run=run,
+            execution_index=1,
+            agent_kind=CoachAgentKind.FLAGSHIP_FINAL,
+            agent_name="flagship-final-run-1",
+            status=CoachAgentExecutionStatus.COMPLETED,
+            started_at=timezone.now(),
+            finished_at=timezone.now(),
+        )
+        CoachLedgerEntry.objects.create(
+            run=run,
+            agent_execution=execution,
+            sequence=1,
+            entry_kind=LedgerEntryKind.FLAGSHIP_FINAL,
+            agent_kind=CoachAgentKind.FLAGSHIP_FINAL,
+            agent_name=execution.agent_name,
+            content="Final confidence and pacing are much stronger than the opening minute.",
+            payload={
+                "title": "Final reconciliation",
+                "overall_impression": "Final confidence and pacing are much stronger than the opening minute.",
+                "strengths": ["Clear structure", "Confident close"],
+                "improvements": ["Reduce filler words in first minute"],
+                "priority_actions": ["Pause before transitions"],
+                "model_name": "gemini-2.5-pro",
+            },
+        )
+
+        detail_url = reverse("api:session-detail", kwargs={"id": session.id})
+        response = self.client.get(detail_url)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        coach_progress = response.data["coach_progress"]
+        final_reconciliation = coach_progress["final_reconciliation"]
+        self.assertEqual(
+            final_reconciliation["overall_impression"],
+            "Final confidence and pacing are much stronger than the opening minute.",
+        )
+        self.assertEqual(final_reconciliation["model_name"], "gemini-2.5-pro")
+        self.assertEqual(final_reconciliation["strengths"], ["Clear structure", "Confident close"])
+        self.assertEqual(
+            final_reconciliation["improvements"],
+            ["Reduce filler words in first minute"],
+        )
+        self.assertEqual(final_reconciliation["priority_actions"], ["Pause before transitions"])
 
     def test_get_session_timeline_returns_empty_array_when_no_events(self):
         session = CoachingSession.objects.create(
