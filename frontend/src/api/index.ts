@@ -23,6 +23,43 @@ export type SessionStatus =
   | 'coach_failed'
   | 'failed'
 
+export type CoachProgressStatus = 'pending' | 'processing_coach' | 'completed' | 'failed'
+
+export type CoachStageStatus = 'pending' | 'processing' | 'completed' | 'failed'
+
+export interface CoachNote {
+  note_id: string
+  title: string
+  body: string
+  evidence_refs: string[]
+  default_collapsed: boolean
+}
+
+export interface CoachStage {
+  stage_key: string
+  label: string
+  status: CoachStageStatus
+  notes: CoachNote[]
+}
+
+export interface CoachProgress {
+  status: CoachProgressStatus
+  current_stage: string
+  stages: CoachStage[]
+}
+
+export interface Annotation {
+  id: string
+  event_type: string
+  source: 'audio' | 'video'
+  start_ms: number
+  end_ms: number
+  severity: 'low' | 'medium' | 'high'
+  confidence: number
+  summary: string
+  metadata: Record<string, unknown>
+}
+
 export interface CoachingSessionListItem {
   id: string
   title: string
@@ -31,7 +68,9 @@ export interface CoachingSessionListItem {
   status: SessionStatus
 }
 
-export interface CoachingSessionDetail extends CoachingSessionListItem {}
+export interface CoachingSessionDetail extends CoachingSessionListItem {
+  coach_progress: CoachProgress
+}
 
 export interface SessionCreateResponse {
   id: string
@@ -61,6 +100,7 @@ interface MockAuthData {
 interface MockSessionsData {
   sessions: CoachingSessionListItem[]
   session_details?: Record<string, CoachingSessionDetail>
+  timelines_by_session?: Record<string, Annotation[]>
 }
 
 const MOCK_DELAY_MS = 1000
@@ -174,13 +214,24 @@ function getMockSessionDetail(mockData: MockSessionsData, sessionId: string): Co
 
   const listSession = mockData.sessions.find((session) => session.id === sessionId)
   if (listSession) {
-    return listSession
+    return {
+      ...listSession,
+      coach_progress: {
+        status: 'pending',
+        current_stage: '',
+        stages: [],
+      },
+    }
   }
 
   throw {
     message: 'Session not found.',
     status: 404,
   } satisfies ApiError
+}
+
+function getMockTimeline(mockData: MockSessionsData, sessionId: string): Annotation[] {
+  return mockData.timelines_by_session?.[sessionId] ?? []
 }
 
 export const api = {
@@ -287,6 +338,7 @@ export const api = {
         return mockData.sessions
       }
 
+      // TODO: real endpoint - GET /api/v1/sessions
       const response = await fetch(`${API_BASE_URL}/api/v1/sessions`, {
         method: 'GET',
         credentials: 'include',
@@ -302,6 +354,7 @@ export const api = {
       }
 
       const csrfToken = getCsrfTokenFromCookie()
+      // TODO: real endpoint - POST /api/v1/sessions
       const response = await fetch(`${API_BASE_URL}/api/v1/sessions`, {
         method: 'POST',
         credentials: 'include',
@@ -329,6 +382,7 @@ export const api = {
       const formData = new FormData()
       formData.append('video', videoFile)
 
+      // TODO: real endpoint - POST /api/v1/sessions/:id/video
       const response = await fetch(`${API_BASE_URL}/api/v1/sessions/${sessionId}/video`, {
         method: 'POST',
         credentials: 'include',
@@ -370,6 +424,7 @@ export const api = {
         formData.append('context', contextText)
       }
 
+      // TODO: real endpoint - POST /api/v1/sessions/:id/assets
       const response = await fetch(`${API_BASE_URL}/api/v1/sessions/${sessionId}/assets`, {
         method: 'POST',
         credentials: 'include',
@@ -389,6 +444,7 @@ export const api = {
       }
 
       const csrfToken = getCsrfTokenFromCookie()
+      // TODO: real endpoint - POST /api/v1/sessions/:id/start-analysis
       const response = await fetch(`${API_BASE_URL}/api/v1/sessions/${sessionId}/start-analysis`, {
         method: 'POST',
         credentials: 'include',
@@ -407,12 +463,29 @@ export const api = {
         return getMockSessionDetail(mockData, sessionId)
       }
 
+      // TODO: real endpoint - GET /api/v1/sessions/:id
       const response = await fetch(`${API_BASE_URL}/api/v1/sessions/${sessionId}`, {
         method: 'GET',
         credentials: 'include',
       })
 
       return parseJsonResponse<CoachingSessionDetail>(response)
+    },
+
+    async getTimeline(sessionId: string): Promise<Annotation[]> {
+      if (USE_MOCK) {
+        await delay(MOCK_DELAY_MS)
+        const mockData = await getMockSessionsData()
+        return getMockTimeline(mockData, sessionId)
+      }
+
+      // TODO: real endpoint - GET /api/v1/sessions/:id/timeline
+      const response = await fetch(`${API_BASE_URL}/api/v1/sessions/${sessionId}/timeline`, {
+        method: 'GET',
+        credentials: 'include',
+      })
+
+      return parseJsonResponse<Annotation[]>(response)
     },
   },
 }

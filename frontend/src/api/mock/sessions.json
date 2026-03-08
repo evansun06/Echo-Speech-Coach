@@ -27,15 +27,181 @@
       "id": "mock-123",
       "title": "Mock Session Run",
       "created_at": "2026-03-08T12:00:00Z",
-      "duration_seconds": 0,
-      "status": "queued_ml"
+      "duration_seconds": 392,
+      "status": "processing_coach",
+      "coach_progress": {
+        "status": "processing_coach",
+        "current_stage": "clarity",
+        "stages": [
+          {
+            "stage_key": "delivery",
+            "label": "Delivery",
+            "status": "completed",
+            "notes": [
+              {
+                "note_id": "note-delivery-1",
+                "title": "Pace settled after opening",
+                "body": "You started fast in the first 30 seconds, then stabilized into a conversational rhythm.",
+                "evidence_refs": ["00:00-00:30", "01:10-02:05"],
+                "default_collapsed": false
+              }
+            ]
+          },
+          {
+            "stage_key": "clarity",
+            "label": "Clarity",
+            "status": "processing",
+            "notes": [
+              {
+                "note_id": "note-clarity-1",
+                "title": "Working draft insight",
+                "body": "Coach is still synthesizing a complete clarity assessment.",
+                "evidence_refs": [],
+                "default_collapsed": true
+              }
+            ]
+          },
+          {
+            "stage_key": "presence",
+            "label": "Presence",
+            "status": "pending",
+            "notes": []
+          }
+        ]
+      }
     },
     "sess_001": {
       "id": "sess_001",
       "title": "Investor Pitch Rehearsal",
       "created_at": "2026-03-06T16:40:00Z",
       "duration_seconds": 512,
-      "status": "ready"
+      "status": "ready",
+      "coach_progress": {
+        "status": "completed",
+        "current_stage": "presence",
+        "stages": [
+          {
+            "stage_key": "delivery",
+            "label": "Delivery",
+            "status": "completed",
+            "notes": [
+              {
+                "note_id": "note-ready-delivery-1",
+                "title": "Strong close",
+                "body": "Your final minute was clear, concise, and confident.",
+                "evidence_refs": ["07:10-08:20"],
+                "default_collapsed": false
+              }
+            ]
+          },
+          {
+            "stage_key": "clarity",
+            "label": "Clarity",
+            "status": "completed",
+            "notes": [
+              {
+                "note_id": "note-ready-clarity-1",
+                "title": "Revenue model explanation improved",
+                "body": "The revised phrasing around pricing tiers reduced ambiguity.",
+                "evidence_refs": ["03:20-03:55"],
+                "default_collapsed": true
+              }
+            ]
+          },
+          {
+            "stage_key": "presence",
+            "label": "Presence",
+            "status": "completed",
+            "notes": [
+              {
+                "note_id": "note-ready-presence-1",
+                "title": "Consistent eye contact",
+                "body": "Camera-facing posture and eye line were sustained for most of the talk.",
+                "evidence_refs": ["01:30-06:45"],
+                "default_collapsed": true
+              }
+            ]
+          }
+        ]
+      }
     }
+  },
+  "timelines_by_session": {
+    "mock-123": [
+      {
+        "id": "ann-mock-audio-1",
+        "event_type": "filler_words",
+        "source": "audio",
+        "start_ms": 18000,
+        "end_ms": 19500,
+        "severity": "medium",
+        "confidence": 0.84,
+        "summary": "Frequent filler words during market size explanation.",
+        "metadata": {
+          "count": 6
+        }
+      },
+      {
+        "id": "ann-mock-audio-2",
+        "event_type": "pace_spike",
+        "source": "audio",
+        "start_ms": 64000,
+        "end_ms": 70000,
+        "severity": "low",
+        "confidence": 0.78,
+        "summary": "Speech rate briefly increased before stabilizing.",
+        "metadata": {
+          "wpm_peak": 182
+        }
+      },
+      {
+        "id": "ann-mock-video-1",
+        "event_type": "eye_contact_drop",
+        "source": "video",
+        "start_ms": 40000,
+        "end_ms": 52000,
+        "severity": "medium",
+        "confidence": 0.81,
+        "summary": "Gaze shifted off-camera while reading notes.",
+        "metadata": {
+          "direction": "down-right"
+        }
+      },
+      {
+        "id": "ann-mock-video-2",
+        "event_type": "gesture_freeze",
+        "source": "video",
+        "start_ms": 98000,
+        "end_ms": 116000,
+        "severity": "low",
+        "confidence": 0.73,
+        "summary": "Hand movement reduced during transition section.",
+        "metadata": {}
+      }
+    ],
+    "sess_001": [
+      {
+        "id": "ann-ready-audio-1",
+        "event_type": "pacing_consistency",
+        "source": "audio",
+        "start_ms": 120000,
+        "end_ms": 180000,
+        "severity": "low",
+        "confidence": 0.89,
+        "summary": "Pacing remained stable through product demo segment.",
+        "metadata": {}
+      },
+      {
+        "id": "ann-ready-video-1",
+        "event_type": "posture_shift",
+        "source": "video",
+        "start_ms": 250000,
+        "end_ms": 268000,
+        "severity": "low",
+        "confidence": 0.77,
+        "summary": "Brief posture shift detected while changing slides.",
+        "metadata": {}
+      }
+    ]
   }
 }
