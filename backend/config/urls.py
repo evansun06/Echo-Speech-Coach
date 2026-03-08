@@ -20,7 +20,7 @@ from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView
 
 # User exposed
 api_urls = [
-
+    path("clients/", include("clients.urls")),
 ]
 
 urlpatterns = [
