@@ -1,4 +1,8 @@
+import importlib.util
+import sys
 import tempfile
+import types
+import unittest
 from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,6 +18,24 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
 
+from llm.coach_graph import build_reasoning_graph, run_reasoning_graph
+from llm.ledger import (
+    LedgerValidationError,
+    RunStateError,
+    append_ledger_entry,
+    create_agent_execution,
+    create_orchestration_run,
+    mark_agent_completed,
+    mark_agent_failed,
+    mark_agent_processing,
+    mark_run_completed,
+    mark_run_failed,
+    mark_run_processing,
+    read_ledger_slice,
+    touch_agent_heartbeat,
+)
+from llm.provider import ModelConfigurationError, ReasoningModels, build_reasoning_models
+from llm.schemas import ReasoningInput
 from ml.enqueue import enqueue_random_sleep_demo_job, enqueue_random_sleep_demo_jobs
 from sessions.models import (
     CoachAgentExecution,
@@ -28,6 +50,11 @@ from sessions.models import (
     CoachingSession,
     MaxFileSizeValidator,
     SessionStatus,
+)
+
+HAS_LANGGRAPH_STACK = (
+    importlib.util.find_spec("langgraph") is not None
+    and importlib.util.find_spec("langchain_core") is not None
 )
 
 
@@ -107,6 +134,105 @@ class EnqueueDemoJobsCommandTests(SimpleTestCase):
                 "--max-seconds",
                 "1",
             )
+
+
+class GeminiReasoningProviderTests(SimpleTestCase):
+    def test_build_reasoning_models_requires_api_key(self):
+        with self.assertRaises(ModelConfigurationError):
+            build_reasoning_models(api_key="")
+
+    def test_build_reasoning_models_uses_configured_model_ids(self):
+        captured_configs: list[dict[str, object]] = []
+
+        class FakeChatGoogleGenerativeAI:
+            def __init__(self, **kwargs):
+                captured_configs.append(kwargs)
+                self.model = kwargs.get("model")
+
+        fake_module = types.ModuleType("langchain_google_genai")
+        fake_module.ChatGoogleGenerativeAI = FakeChatGoogleGenerativeAI
+
+        with patch.dict(sys.modules, {"langchain_google_genai": fake_module}):
+            with override_settings(
+                GEMINI_API_KEY="test-api-key",
+                GEMINI_SUBAGENT_MODEL="gemini-2.0-flash",
+                GEMINI_PRIMARY_MODEL="gemini-3.0-pro",
+                GEMINI_SUBAGENT_TEMPERATURE=0.2,
+                GEMINI_PRIMARY_TEMPERATURE=0.1,
+            ):
+                models = build_reasoning_models()
+
+        self.assertEqual(models.subagent_model_name, "gemini-2.0-flash")
+        self.assertEqual(models.primary_model_name, "gemini-3.0-pro")
+        self.assertEqual(len(captured_configs), 2)
+        self.assertEqual(captured_configs[0]["model"], "gemini-2.0-flash")
+        self.assertEqual(captured_configs[1]["model"], "gemini-3.0-pro")
+        self.assertEqual(captured_configs[0]["google_api_key"], "test-api-key")
+        self.assertEqual(captured_configs[1]["google_api_key"], "test-api-key")
+        self.assertEqual(captured_configs[0]["temperature"], 0.2)
+        self.assertEqual(captured_configs[1]["temperature"], 0.1)
+
+
+@unittest.skipUnless(
+    HAS_LANGGRAPH_STACK,
+    "langgraph/langchain-core dependencies are not installed",
+)
+class LangGraphReasoningTests(SimpleTestCase):
+    def test_graph_routes_subagent_and_primary_to_expected_models(self):
+        class FakeModel:
+            def __init__(self, response_text: str):
+                self.response_text = response_text
+                self.calls = []
+
+            def invoke(self, messages):
+                self.calls.append(messages)
+                return SimpleNamespace(
+                    content=self.response_text,
+                    usage_metadata={
+                        "input_tokens": 11,
+                        "output_tokens": 7,
+                        "total_tokens": 18,
+                    },
+                    response_metadata={"finish_reason": "stop"},
+                )
+
+        subagent = FakeModel("subagent note")
+        primary = FakeModel("primary impression")
+        models = ReasoningModels(
+            subagent=subagent,
+            primary=primary,
+            subagent_model_name="gemini-2.0-flash",
+            primary_model_name="gemini-3.0-pro",
+        )
+        graph = build_reasoning_graph(models=models)
+
+        subagent_result = run_reasoning_graph(
+            graph=graph,
+            reasoning_input=ReasoningInput(
+                role="subagent",
+                system_prompt="system",
+                user_prompt="window events",
+                metadata={"window_start_ms": 0},
+            ),
+        )
+        primary_result = run_reasoning_graph(
+            graph=graph,
+            reasoning_input=ReasoningInput(
+                role="primary",
+                system_prompt="system",
+                user_prompt="ledger updates",
+                metadata={"input_seq_from": 1},
+            ),
+        )
+
+        self.assertEqual(len(subagent.calls), 1)
+        self.assertEqual(len(primary.calls), 1)
+        self.assertEqual(subagent_result.output_text, "subagent note")
+        self.assertEqual(primary_result.output_text, "primary impression")
+        self.assertEqual(subagent_result.model_name, "gemini-2.0-flash")
+        self.assertEqual(primary_result.model_name, "gemini-3.0-pro")
+        self.assertEqual(subagent_result.usage["total_tokens"], 18)
+        self.assertEqual(primary_result.response_metadata["finish_reason"], "stop")
 
 
 class CoachingSessionModelTests(TestCase):
@@ -315,6 +441,203 @@ class CoachOrchestrationModelsTests(TestCase):
                 agent_name="flagship",
                 content="Duplicate sequence",
             )
+
+
+class CoachLedgerServiceTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            username="ledger-service@example.com",
+            email="ledger-service@example.com",
+            password="password123",
+        )
+        self.session = CoachingSession.objects.create(
+            user=self.user,
+            status=SessionStatus.PROCESSING_COACH,
+            video_file="sessions/videos/2026/03/08/demo.mp4",
+        )
+
+    def test_create_orchestration_run_increments_run_index(self):
+        CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.COMPLETED,
+        )
+
+        run = create_orchestration_run(session=self.session)
+
+        self.assertEqual(run.run_index, 2)
+        self.assertEqual(run.status, CoachOrchestrationRunStatus.QUEUED)
+
+    def test_create_orchestration_run_rejects_session_with_active_run(self):
+        CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.QUEUED,
+        )
+
+        with self.assertRaises(RunStateError):
+            create_orchestration_run(session=self.session)
+
+    def test_create_agent_execution_increments_execution_index(self):
+        run = CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.PROCESSING,
+        )
+
+        first = create_agent_execution(
+            run=run,
+            agent_kind=CoachAgentKind.SUBAGENT,
+            agent_name="subagent-window-1",
+            window_start_ms=0,
+            window_end_ms=30_000,
+        )
+        second = create_agent_execution(
+            run=run,
+            agent_kind=CoachAgentKind.FLAGSHIP_PERIODIC,
+            agent_name="flagship-pass-1",
+        )
+
+        self.assertEqual(first.execution_index, 1)
+        self.assertEqual(second.execution_index, 2)
+
+    def test_append_ledger_entry_allocates_sequence_and_updates_run(self):
+        run = CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.PROCESSING,
+        )
+        execution = create_agent_execution(
+            run=run,
+            agent_kind=CoachAgentKind.SUBAGENT,
+            agent_name="subagent-window-1",
+            window_start_ms=0,
+            window_end_ms=30_000,
+        )
+
+        first = append_ledger_entry(
+            run=run,
+            entry_kind=LedgerEntryKind.SUBAGENT_NOTE,
+            content="Local pacing improved in this window.",
+            agent_execution=execution,
+            payload={"title": "Pacing"},
+        )
+        second = append_ledger_entry(
+            run=run,
+            entry_kind=LedgerEntryKind.FLAGSHIP_IMPRESSION,
+            content="Overall pacing trend is stable.",
+            agent_kind=CoachAgentKind.FLAGSHIP_PERIODIC,
+            agent_name="flagship-pass-1",
+        )
+
+        run.refresh_from_db()
+        self.assertEqual(first.sequence, 1)
+        self.assertEqual(second.sequence, 2)
+        self.assertEqual(run.latest_ledger_sequence, 2)
+        self.assertEqual(first.agent_name, "subagent-window-1")
+        self.assertEqual(second.agent_name, "flagship-pass-1")
+
+    def test_append_ledger_entry_validates_execution_belongs_to_run(self):
+        run = CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.PROCESSING,
+        )
+        second_run = CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=2,
+            status=CoachOrchestrationRunStatus.FAILED,
+        )
+        execution = create_agent_execution(
+            run=run,
+            agent_kind=CoachAgentKind.SUBAGENT,
+            agent_name="subagent-window-1",
+        )
+
+        with self.assertRaises(LedgerValidationError):
+            append_ledger_entry(
+                run=second_run,
+                entry_kind=LedgerEntryKind.SUBAGENT_NOTE,
+                content="Invalid linkage",
+                agent_execution=execution,
+            )
+
+    def test_read_ledger_slice_filters_by_sequence_and_kind(self):
+        run = CoachOrchestrationRun.objects.create(
+            session=self.session,
+            run_index=1,
+            status=CoachOrchestrationRunStatus.PROCESSING,
+        )
+        append_ledger_entry(
+            run=run,
+            entry_kind=LedgerEntryKind.SUBAGENT_NOTE,
+            content="Entry 1",
+            agent_kind=CoachAgentKind.SUBAGENT,
+            agent_name="subagent-1",
+        )
+        append_ledger_entry(
+            run=run,
+            entry_kind=LedgerEntryKind.FLAGSHIP_IMPRESSION,
+            content="Entry 2",
+            agent_kind=CoachAgentKind.FLAGSHIP_PERIODIC,
+            agent_name="flagship",
+        )
+        append_ledger_entry(
+            run=run,
+            entry_kind=LedgerEntryKind.SUBAGENT_NOTE,
+            content="Entry 3",
+            agent_kind=CoachAgentKind.SUBAGENT,
+            agent_name="subagent-2",
+        )
+
+        entries = read_ledger_slice(
+            run=run,
+            sequence_gt=1,
+            sequence_lte=3,
+            entry_kind=LedgerEntryKind.SUBAGENT_NOTE,
+        )
+        self.assertEqual([entry.sequence for entry in entries], [3])
+
+    def test_run_and_agent_lifecycle_helpers_update_status_and_timestamps(self):
+        run = create_orchestration_run(session=self.session)
+        run = mark_run_processing(run=run)
+        self.assertEqual(run.status, CoachOrchestrationRunStatus.PROCESSING)
+        self.assertIsNotNone(run.started_at)
+
+        execution = create_agent_execution(
+            run=run,
+            agent_kind=CoachAgentKind.SUBAGENT,
+            agent_name="subagent-window-1",
+        )
+        execution = mark_agent_processing(execution=execution)
+        execution = touch_agent_heartbeat(execution=execution)
+        execution = mark_agent_completed(execution=execution, output_seq_to=4)
+        self.assertEqual(execution.status, CoachAgentExecutionStatus.COMPLETED)
+        self.assertIsNotNone(execution.last_heartbeat_at)
+        self.assertEqual(execution.output_seq_to, 4)
+
+        run = mark_run_completed(run=run)
+        self.assertEqual(run.status, CoachOrchestrationRunStatus.COMPLETED)
+        self.assertIsNotNone(run.completed_at)
+
+    def test_failed_lifecycle_helpers_capture_error_message(self):
+        run = create_orchestration_run(session=self.session)
+        run = mark_run_failed(run=run, error_message="failure on run")
+        self.assertEqual(run.status, CoachOrchestrationRunStatus.FAILED)
+        self.assertEqual(run.error_message, "failure on run")
+
+        execution = create_agent_execution(
+            run=run,
+            agent_kind=CoachAgentKind.FLAGSHIP_FINAL,
+            agent_name="flagship-final",
+        )
+        execution = mark_agent_failed(
+            execution=execution,
+            error_message="failure on final pass",
+        )
+        self.assertEqual(execution.status, CoachAgentExecutionStatus.FAILED)
+        self.assertEqual(execution.error_message, "failure on final pass")
 
 
 class CoachingSessionApiTests(TestCase):

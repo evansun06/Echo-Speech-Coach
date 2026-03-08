@@ -1,3 +1,3 @@
 """
-Package for LLM Orchastration
+LangGraph-powered reasoning and ledger orchestration helpers.
 """
