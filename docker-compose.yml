@@ -1,5 +1,6 @@
 services:
   backend:
+    platform: linux/amd64
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -9,11 +10,14 @@ services:
     environment:
       - MEDIA_ROOT=${MEDIA_ROOT:-/app/media}
       - MEDIA_URL=${MEDIA_URL:-/media/}
+      - GOOGLE_APPLICATION_CREDENTIALS=/var/secrets/google/adc.json
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}
     ports:
       - "8000:8000"
     volumes:
       - ./backend:/app
       - backend_media:/app/media
+      - ${HOME}/.config/gcloud/application_default_credentials.json:/var/secrets/google/adc.json:ro
     depends_on:
       db:
         condition: service_healthy
@@ -32,6 +36,7 @@ services:
     restart: unless-stopped
 
   celery:
+    platform: linux/amd64
     build: ./backend
     command: celery -A config worker -l ${CELERY_WORKER_LOGLEVEL:-info} -E
     env_file:
@@ -39,9 +44,12 @@ services:
     environment:
       - MEDIA_ROOT=${MEDIA_ROOT:-/app/media}
       - MEDIA_URL=${MEDIA_URL:-/media/}
+      - GOOGLE_APPLICATION_CREDENTIALS=/var/secrets/google/adc.json
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}
     volumes:
       - ./backend:/app
       - backend_media:/app/media
+      - ${HOME}/.config/gcloud/application_default_credentials.json:/var/secrets/google/adc.json:ro
     depends_on:
       redis:
         condition: service_healthy

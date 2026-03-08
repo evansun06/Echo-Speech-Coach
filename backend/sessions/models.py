@@ -325,3 +325,72 @@ class CoachLedgerEntry(models.Model):
 
     def __str__(self) -> str:
         return f"{self.run_id} seq={self.sequence} ({self.entry_kind})"
+
+
+class SessionOverallMetrics(models.Model):
+    session = models.OneToOneField(
+        CoachingSession,
+        on_delete=models.CASCADE,
+        primary_key=True,
+        related_name="overall_metrics_row",
+        db_column="session_uuid",
+    )
+    metrics = models.JSONField()
+
+    class Meta:
+        db_table = "session_overall_metrics"
+
+    def __str__(self) -> str:
+        return f"{self.session_id} overall_metrics"
+
+
+class SessionAlignedWord(models.Model):
+    session = models.ForeignKey(
+        CoachingSession,
+        on_delete=models.CASCADE,
+        related_name="aligned_words",
+        db_column="session_uuid",
+    )
+    word_id = models.IntegerField()
+    pk = models.CompositePrimaryKey("session", "word_id")
+    word_json = models.JSONField()
+    start_time = models.FloatField()
+    end_time = models.FloatField()
+
+    class Meta:
+        db_table = "session_aligned_words"
+        indexes = [
+            models.Index(
+                fields=["session", "start_time"],
+                name="sess_align_s_start_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.session_id} word#{self.word_id}"
+
+
+class SessionEvent(models.Model):
+    session = models.ForeignKey(
+        CoachingSession,
+        on_delete=models.CASCADE,
+        related_name="events",
+        db_column="session_uuid",
+    )
+    event_id = models.IntegerField()
+    pk = models.CompositePrimaryKey("session", "event_id")
+    event_json = models.JSONField()
+    start_time = models.FloatField()
+    end_time = models.FloatField()
+
+    class Meta:
+        db_table = "session_events"
+        indexes = [
+            models.Index(
+                fields=["session", "start_time"],
+                name="sess_event_s_start_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.session_id} event#{self.event_id}"

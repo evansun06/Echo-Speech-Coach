@@ -5,6 +5,7 @@ from .models import (
     CoachLedgerEntry,
     CoachOrchestrationRun,
     CoachingSession,
+    SessionOverallMetrics,
 )
 
 
@@ -57,3 +58,9 @@ class CoachLedgerEntryAdmin(admin.ModelAdmin):
     )
     list_filter = ("entry_kind", "agent_kind", "created_at")
     search_fields = ("id", "run__id", "agent_name", "content")
+
+
+@admin.register(SessionOverallMetrics)
+class SessionOverallMetricsAdmin(admin.ModelAdmin):
+    list_display = ("session",)
+    search_fields = ("session__id",)
