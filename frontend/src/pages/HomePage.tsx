@@ -713,7 +713,7 @@ function HomePage() {
                         <Button
                           variant="contained"
                           onClick={handleStartRecording}
-                          disabled={isRecording || isCameraLoading || isSubmitting}
+                          disabled={isRecording || isCameraLoading || isSubmitting || videoFile !== null}
                         >
                           Record
                         </Button>
