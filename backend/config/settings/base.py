@@ -156,6 +156,10 @@ CELERY_TASK_TRACK_STARTED = _env_bool("CELERY_TASK_TRACK_STARTED", True)
 CELERY_WORKER_SEND_TASK_EVENTS = _env_bool("CELERY_WORKER_SEND_TASK_EVENTS", True)
 CELERY_TASK_SEND_SENT_EVENT = _env_bool("CELERY_TASK_SEND_SENT_EVENT", True)
 
+# ML
+# Disable sample fallback by default so real session media is always analyzed.
+ML_ALLOW_SAMPLE_FALLBACK = _env_bool("ML_ALLOW_SAMPLE_FALLBACK", False)
+
 # LLM live-ledger storage
 LLM_LEDGER_REDIS_URL = os.environ.get("LLM_LEDGER_REDIS_URL", CELERY_BROKER_URL)
 LLM_LEDGER_REDIS_TTL_SECONDS = int(

@@ -1,6 +1,7 @@
+// Hackathon hard-switch: force real backend paths, ignore Vite mock/demo flags.
 export const CHAT_USE_MOCK = false
 export const SESSIONS_USE_MOCK = false
-export const DEMO_AI_WALKTHROUGH = true
+export const DEMO_AI_WALKTHROUGH = false
 const AUTH_USE_MOCK = false
 export const API_BASE_URL = 'http://localhost:8000'
 
@@ -28,6 +29,7 @@ export type SessionStatus =
 export type CoachProgressStatus = 'pending' | 'processing_coach' | 'completed' | 'failed'
 
 export type CoachStageStatus = 'pending' | 'processing' | 'completed' | 'failed'
+export type CoachNoteKind = 'window_impression' | 'event_note' | 'general'
 
 export interface CoachNote {
   note_id: string
@@ -35,6 +37,10 @@ export interface CoachNote {
   body: string
   evidence_refs: string[]
   default_collapsed: boolean
+  note_kind: CoachNoteKind
+  event_id: string | null
+  event_type: string | null
+  sequence: number | null
 }
 
 export interface CoachStage {
@@ -58,6 +64,32 @@ export interface CoachAgentProgress {
   started_at: string | null
   completed_at: string | null
   last_heartbeat_at: string | null
+  model_name: string
+  window_label: string
+  window_impression: CoachNote | null
+  reasoning_events: CoachNote[]
+}
+
+export interface CoachLedgerEntry {
+  sequence: number
+  entry_kind: string
+  agent_kind: 'subagent' | 'flagship_periodic' | 'flagship_final' | null
+  agent_name: string
+  window_start_ms: number | null
+  window_end_ms: number | null
+  content: string
+  payload: Record<string, unknown>
+  created_at: string
+}
+
+export interface CoachFinalReconciliation {
+  agent_name: string
+  model_name: string
+  overall_impression: string
+  strengths: string[]
+  improvements: string[]
+  priority_actions: string[]
+  created_at: string
 }
 
 export interface CoachProgress {
@@ -69,6 +101,8 @@ export interface CoachProgress {
   updated_at?: string
   agent_progress?: CoachAgentProgress[]
   stages: CoachStage[]
+  ledger_entries?: CoachLedgerEntry[]
+  final_reconciliation?: CoachFinalReconciliation | null
 }
 
 export interface Annotation {

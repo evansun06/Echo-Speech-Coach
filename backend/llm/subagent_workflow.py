@@ -34,6 +34,8 @@ from .live_ledger import (
 from .orchestrator import run_subagent_structured_reasoning
 
 SUBAGENT_OUTPUT_SCHEMA: dict[str, Any] = {
+    "title": "subagent_window_output",
+    "description": "Structured note payload for one subagent window.",
     "type": "object",
     "properties": {
         "notes": {
@@ -356,6 +358,7 @@ def run_subagent_execution(
                     "note_type": "event_note",
                     "event_id": note["event_id"],
                     "event_type": note["event_type"],
+                    "model_name": reasoning_result.model_name,
                 },
             )
             last_sequence = entry["sequence"]
@@ -372,6 +375,7 @@ def run_subagent_execution(
             payload={
                 "title": "Window impression",
                 "note_type": "window_impression",
+                "model_name": reasoning_result.model_name,
             },
         )
         last_sequence = impression_entry["sequence"]

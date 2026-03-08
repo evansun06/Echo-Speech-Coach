@@ -226,6 +226,31 @@
         }
       },
       {
+        "id": "ann-mock-audio-3",
+        "event_type": "volume_drop",
+        "source": "audio",
+        "start_ms": 46000,
+        "end_ms": 56000,
+        "severity": "high",
+        "confidence": 0.61,
+        "summary": "Volume dipped while introducing the second key point.",
+        "metadata": {
+          "confidence": 0.88,
+          "dbfs_delta": -8
+        }
+      },
+      {
+        "id": "ann-mock-video-3",
+        "event_type": "gesture_reset",
+        "source": "video",
+        "start_ms": 49000,
+        "end_ms": 54500,
+        "severity": "low",
+        "confidence": 0.74,
+        "summary": "Hands reset near waist before the next example.",
+        "metadata": {}
+      },
+      {
         "id": "ann-mock-video-2",
         "event_type": "gesture_freeze",
         "source": "video",

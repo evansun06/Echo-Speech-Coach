@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from celery.result import AsyncResult
 
-from .tasks import random_sleep_demo_task
+from .tasks import random_sleep_demo_task, run_session_ml_workflow_task
 
 
 def enqueue_random_sleep_demo_job(
@@ -36,3 +36,12 @@ def enqueue_random_sleep_demo_jobs(
         )
         task_ids.append(async_result.id)
     return task_ids
+
+
+def enqueue_session_ml_workflow_job(*, session_id: str) -> AsyncResult:
+    """Enqueue the real session ML workflow task."""
+    return run_session_ml_workflow_task.apply_async(
+        kwargs={
+            "session_id": str(session_id),
+        }
+    )
