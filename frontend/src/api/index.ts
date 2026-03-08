@@ -21,6 +21,25 @@ export interface CurrentUserResponse {
   user: AuthUser
 }
 
+export type SessionStatus =
+  | 'draft'
+  | 'media_attached'
+  | 'queued_ml'
+  | 'processing_ml'
+  | 'ml_ready'
+  | 'processing_coach'
+  | 'ready'
+  | 'coach_failed'
+  | 'failed'
+
+export interface CoachingSessionListItem {
+  id: string
+  title: string
+  created_at: string
+  duration_seconds: number
+  status: SessionStatus
+}
+
 export interface ApiError {
   message: string
   status?: number
@@ -34,6 +53,10 @@ interface MockAuthData {
     invalid_credentials: string
     email_already_exists: string
   }
+}
+
+interface MockSessionsData {
+  sessions: CoachingSessionListItem[]
 }
 
 function getCookieValue(name: string): string | null {
@@ -85,6 +108,13 @@ async function getMockAuthData(): Promise<MockAuthData> {
   const response = await fetch(mockUrl)
 
   return parseJsonResponse<MockAuthData>(response)
+}
+
+async function getMockSessionsData(): Promise<MockSessionsData> {
+  const mockUrl = new URL('./mock/sessions.json', import.meta.url).href
+  const response = await fetch(mockUrl)
+
+  return parseJsonResponse<MockSessionsData>(response)
 }
 
 export const api = {
@@ -152,6 +182,21 @@ export const api = {
       })
 
       return parseJsonResponse<CurrentUserResponse>(response)
+    },
+  },
+  sessions: {
+    async list(): Promise<CoachingSessionListItem[]> {
+      if (USE_MOCK) {
+        const mockData = await getMockSessionsData()
+        return mockData.sessions
+      }
+
+      const response = await fetch(`${API_BASE_URL}/api/v1/sessions`, {
+        method: 'GET',
+        credentials: 'include',
+      })
+
+      return parseJsonResponse<CoachingSessionListItem[]>(response)
     },
   },
 }
