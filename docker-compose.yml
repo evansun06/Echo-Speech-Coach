@@ -27,6 +27,46 @@ services:
       - frontend_node_modules:/app/node_modules
     restart: unless-stopped
 
+  celery:
+    build: ./backend
+    command: celery -A config worker -l ${CELERY_WORKER_LOGLEVEL:-info} -E
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+    restart: unless-stopped
+
+  flower:
+    image: mher/flower
+    command: celery --broker=${CELERY_BROKER_URL} flower --port=${FLOWER_PORT:-5555} --basic-auth=${FLOWER_BASIC_AUTH}
+    env_file:
+      - .env
+    ports:
+      - "${FLOWER_PORT:-5555}:${FLOWER_PORT:-5555}"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine 
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
   db:
     image: postgres:15-alpine
     environment:
@@ -47,3 +87,4 @@ services:
 volumes:
   frontend_node_modules:
   postgres_data:
+  redis_data:

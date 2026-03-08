@@ -11,6 +11,13 @@ def _env_list(name: str, default: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
@@ -137,3 +144,12 @@ SPECTACULAR_SETTINGS = {
     "DESCRIPTION": "Speech Coach backend API schema.",
     "VERSION": "1.0.0",
 }
+
+# Celery
+CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://redis:6379/0")
+CELERY_RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", "redis://redis:6379/1")
+CELERY_RESULT_EXPIRES = int(os.environ.get("CELERY_RESULT_EXPIRES", "3600"))
+CELERY_IMPORTS = ("ml.tasks",)
+CELERY_TASK_TRACK_STARTED = _env_bool("CELERY_TASK_TRACK_STARTED", True)
+CELERY_WORKER_SEND_TASK_EVENTS = _env_bool("CELERY_WORKER_SEND_TASK_EVENTS", True)
+CELERY_TASK_SEND_SENT_EVENT = _env_bool("CELERY_TASK_SEND_SENT_EVENT", True)
