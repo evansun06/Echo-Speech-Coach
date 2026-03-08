@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Alert, Box, Button, Card, CardContent, Chip, CircularProgress, Container, Stack, Typography } from '@mui/material'
+import { useNavigate } from 'react-router-dom'
 import api from '../api'
 import type { ApiError, CoachingSessionListItem } from '../api'
 
@@ -42,9 +43,12 @@ function formatStatusLabel(status: string): string {
 }
 
 function HomePage() {
+  const navigate = useNavigate()
   const [sessions, setSessions] = useState<CoachingSessionListItem[]>([])
   const [isLoading, setIsLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [isLoggingOut, setIsLoggingOut] = useState(false)
+  const [logoutError, setLogoutError] = useState<string | null>(null)
 
   useEffect(() => {
     let isMounted = true
@@ -77,6 +81,21 @@ function HomePage() {
     }
   }, [])
 
+  const handleLogout = async () => {
+    setLogoutError(null)
+    setIsLoggingOut(true)
+
+    try {
+      await api.auth.logout()
+      navigate('/login')
+    } catch (logoutRequestError) {
+      const apiError = logoutRequestError as ApiError
+      setLogoutError(apiError.message || 'Logout failed. Please try again.')
+    } finally {
+      setIsLoggingOut(false)
+    }
+  }
+
   return (
     <Container maxWidth="md" sx={{ py: 6 }}>
       <Stack spacing={3}>
@@ -84,7 +103,12 @@ function HomePage() {
           <Typography component="h1" variant="h4">
             Coaching Sessions
           </Typography>
-          <Button variant="contained">New Session</Button>
+          <Stack direction="row" spacing={1.5}>
+            <Button variant="contained">New Session</Button>
+            <Button variant="outlined" color="inherit" onClick={handleLogout} disabled={isLoggingOut}>
+              {isLoggingOut ? 'Logging out...' : 'Log out'}
+            </Button>
+          </Stack>
         </Stack>
 
         {isLoading ? (
@@ -94,6 +118,7 @@ function HomePage() {
           </Stack>
         ) : (
           <>
+            {logoutError && <Alert severity="error">{logoutError}</Alert>}
             {error && <Alert severity="error">{error}</Alert>}
 
             {!error && sessions.length === 0 ? (

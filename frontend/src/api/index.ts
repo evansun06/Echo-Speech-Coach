@@ -1,4 +1,5 @@
 export const USE_MOCK = true
+const AUTH_USE_MOCK = false
 export const API_BASE_URL = 'http://localhost:8000'
 
 export interface AuthUser {
@@ -7,19 +8,9 @@ export interface AuthUser {
   email: string
 }
 
-export interface LoginResponse {
-  message: string
-  user: AuthUser
-}
-
-export interface SignupResponse {
-  message: string
-  user: AuthUser
-}
-
-export interface CurrentUserResponse {
-  user: AuthUser
-}
+export type LoginResponse = AuthUser
+export type SignupResponse = AuthUser
+export type CurrentUserResponse = AuthUser
 
 export type SessionStatus =
   | 'draft'
@@ -78,13 +69,37 @@ function getCsrfTokenFromCookie(): string {
   return token
 }
 
+async function getCsrfTokenForPost(): Promise<string> {
+  const existingToken = getCookieValue('csrftoken')
+  if (existingToken) {
+    return existingToken
+  }
+
+  const csrfResponse = await fetch(`${API_BASE_URL}/api/v1/clients/csrf`, {
+    method: 'GET',
+    credentials: 'include',
+  })
+
+  if (!csrfResponse.ok) {
+    throw {
+      message: `Failed to initialize CSRF token (status ${csrfResponse.status}).`,
+      status: csrfResponse.status,
+    } satisfies ApiError
+  }
+
+  return getCsrfTokenFromCookie()
+}
+
 async function parseJsonResponse<T>(response: Response): Promise<T> {
   const data = (await response.json().catch(() => null)) as T | null
 
   if (!response.ok) {
+    const errorData = data && typeof data === 'object' ? (data as Record<string, unknown>) : null
     const errorMessage =
-      data && typeof data === 'object' && 'message' in data && typeof data.message === 'string'
-        ? data.message
+      errorData && typeof errorData.message === 'string'
+        ? errorData.message
+        : errorData && typeof errorData.detail === 'string'
+          ? errorData.detail
         : `Request failed with status ${response.status}`
 
     throw {
@@ -120,7 +135,7 @@ async function getMockSessionsData(): Promise<MockSessionsData> {
 export const api = {
   auth: {
     async login(email: string, password: string): Promise<LoginResponse> {
-      if (USE_MOCK) {
+      if (AUTH_USE_MOCK) {
         const mockData = await getMockAuthData()
         if (!email || !password || email === 'fail@example.com') {
           throw { message: mockData.errors.invalid_credentials } satisfies ApiError
@@ -128,7 +143,7 @@ export const api = {
         return mockData.login_success
       }
 
-      const csrfToken = getCsrfTokenFromCookie()
+      const csrfToken = await getCsrfTokenForPost()
 
       // TODO: real endpoint - POST /api/v1/clients/login
       const response = await fetch(`${API_BASE_URL}/api/v1/clients/login`, {
@@ -145,7 +160,7 @@ export const api = {
     },
 
     async signup(name: string, email: string, password: string): Promise<SignupResponse> {
-      if (USE_MOCK) {
+      if (AUTH_USE_MOCK) {
         const mockData = await getMockAuthData()
         if (!name || !email || !password || email === 'taken@example.com') {
           throw { message: mockData.errors.email_already_exists } satisfies ApiError
@@ -153,7 +168,7 @@ export const api = {
         return mockData.signup_success
       }
 
-      const csrfToken = getCsrfTokenFromCookie()
+      const csrfToken = await getCsrfTokenForPost()
 
       // TODO: real endpoint - POST /api/v1/clients/signup
       const response = await fetch(`${API_BASE_URL}/api/v1/clients/signup`, {
@@ -170,7 +185,7 @@ export const api = {
     },
 
     async getCurrentUser(): Promise<CurrentUserResponse> {
-      if (USE_MOCK) {
+      if (AUTH_USE_MOCK) {
         const mockData = await getMockAuthData()
         return mockData.current_user
       }
@@ -182,6 +197,36 @@ export const api = {
       })
 
       return parseJsonResponse<CurrentUserResponse>(response)
+    },
+
+    async logout(): Promise<void> {
+      if (AUTH_USE_MOCK) {
+        return
+      }
+
+      const csrfToken = await getCsrfTokenForPost()
+      const response = await fetch(`${API_BASE_URL}/api/v1/clients/logout`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'X-CSRFToken': csrfToken,
+        },
+      })
+
+      if (!response.ok) {
+        const errorData = (await response.json().catch(() => null)) as Record<string, unknown> | null
+        const errorMessage =
+          errorData && typeof errorData.message === 'string'
+            ? errorData.message
+            : errorData && typeof errorData.detail === 'string'
+              ? errorData.detail
+              : `Request failed with status ${response.status}`
+
+        throw {
+          message: errorMessage,
+          status: response.status,
+        } satisfies ApiError
+      }
     },
   },
   sessions: {
