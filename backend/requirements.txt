@@ -5,3 +5,17 @@ drf-spectacular>=0.27,<1
 django-cors-headers>=4.4,<5
 celery>=5.4,<6
 redis>=5,<6
+
+# ML runtime dependencies used directly by the current pipeline.
+numpy>=2.0,<3.0
+pandas>=2.2,<3.0
+opencv-contrib-python-headless==4.13.0.92
+opensmile==2.6.0
+google-cloud-speech>=2.37,<3
+
+# mediapipe runtime deps (installed separately with --no-deps to avoid
+# pulling non-headless OpenCV).
+absl-py~=2.3
+flatbuffers~=25.9
+matplotlib>=3.9,<4
+sounddevice~=0.5

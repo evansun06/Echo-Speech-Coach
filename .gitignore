@@ -64,6 +64,12 @@ pnpm-debug.log*
 .docker/
 docker-data/
 
+# Local ML artifacts
+backend/ml/run_outputs/
+backend/ml/*.wav
+backend/ml/*.mp4
+secrets/
+
 # Misc temp
 tmp/
 temp/

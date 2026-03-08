@@ -7,6 +7,7 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --no-deps mediapipe==0.10.32
 
 COPY . .
 RUN chmod +x /app/entrypoint.sh
