@@ -52,6 +52,7 @@ class CoachingSession(models.Model):
         on_delete=models.CASCADE,
         related_name="coaching_sessions",
     )
+    title = models.CharField(max_length=255, default="Untitled Session")
     status = models.CharField(
         max_length=32,
         choices=SessionStatus.choices,
@@ -131,4 +132,4 @@ class CoachingSession(models.Model):
         ]
 
     def __str__(self) -> str:
-        return f"{self.id} ({self.status})"
+        return f"{self.title} ({self.id}, {self.status})"
