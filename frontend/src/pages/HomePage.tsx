@@ -24,6 +24,7 @@ import type { ApiError, CoachingSessionListItem, SessionAssetsPayload } from '..
 
 type VideoSource = 'upload' | 'record'
 
+
 function formatCreatedDate(value: string): string {
   const date = new Date(value)
 
@@ -69,7 +70,6 @@ function HomePage() {
   const [error, setError] = useState<string | null>(null)
   const [isLoggingOut, setIsLoggingOut] = useState(false)
   const [logoutError, setLogoutError] = useState<string | null>(null)
-
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [modalStep, setModalStep] = useState(1)
   const [videoSource, setVideoSource] = useState<VideoSource | null>(null)
@@ -263,9 +263,11 @@ function HomePage() {
             Coaching Sessions
           </Typography>
           <Stack direction="row" spacing={1.5}>
+            
             <Button variant="contained" onClick={openNewSessionModal}>
               New Session
             </Button>
+
             <Button variant="outlined" color="inherit" onClick={handleLogout} disabled={isLoggingOut}>
               {isLoggingOut ? 'Logging out...' : 'Log out'}
             </Button>
